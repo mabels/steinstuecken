@@ -2,6 +2,7 @@ package endpoint
 
 import (
 	"net"
+	"time"
 
 	"github.com/rs/zerolog/log"
 )
@@ -20,8 +21,24 @@ type Bound struct {
 }
 
 type Conn struct {
-	Bound *Bound
-	Conn  net.Conn
+	Bound         *Bound
+	Conn          net.Conn
+	_ReadTimeout  time.Duration
+	_WriteTimeout time.Duration
+}
+
+func (c *Conn) ReadTimeout() time.Duration {
+	if c._ReadTimeout == 0 {
+		return time.Duration(time.Hour)
+	}
+	return c._ReadTimeout
+}
+
+func (c *Conn) WriteTimeout() time.Duration {
+	if c._WriteTimeout == 0 {
+		return time.Duration(time.Hour)
+	}
+	return c._WriteTimeout
 }
 
 func NewListen(lp ListenParam) (bound Bound, err error) {

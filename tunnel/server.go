@@ -5,6 +5,7 @@ import (
 	"github.com/mabels/steinstuecken/tunnel/config"
 	"github.com/mabels/steinstuecken/tunnel/drill"
 	"github.com/mabels/steinstuecken/tunnel/endpoint"
+	"github.com/mabels/steinstuecken/tunnel/exit"
 	"github.com/mabels/steinstuecken/tunnel/h2"
 
 	// "github.com/gobwas/ws"
@@ -29,25 +30,41 @@ func (r *MyReader) Close() error {
 
 func main() {
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
-	ssnc := config.SsnConfig{
-		Client: config.SsnConfigClient{
-			UpStreamUrl: "https://localhost:8000/",
-		},
-	}
-	var cleanFn func()
-	var err error
-	ssnc.Client.CertFile, ssnc.Client.KeyFile, cleanFn, err = testutils.GenerateX509()
+
+	certFile, keyFile, cleanFn, err := testutils.GenerateX509()
 	if err != nil {
 		log.Fatal().Err(err).Msg("GenerateX509")
 	}
 	defer cleanFn()
 
+	ssnc := config.SsnConfig{
+		Client: config.SsnConfigClient{
+			CertFile:    certFile,
+			KeyFile:     keyFile,
+			UpStreamUrl: "https://localhost:8000/",
+		},
+		Server: config.SsnConfigServer{
+			CertFile: certFile,
+			KeyFile:  keyFile,
+			Addr:     ":8000",
+		},
+	}
+
 	go func() {
-		h2.H2connServer(ssnc.Client.CertFile, ssnc.Client.KeyFile)
+		h2.Serve(ssnc.Server, &exit.ExitHandler{
+			Exits: map[exit.ExitId]exit.Exit{
+				exit.ExitId("testConnection"): &exit.SimpleDnsExit{
+					Name: "wl.adviser.com",
+					Port: "22",
+					//Name: "www.google.com",
+					//Port: "443",
+				},
+			},
+		})
 	}()
 	// time.Sleep(time.Second)
 
-	tunnel, err := h2.ConnectTunnel(ssnc.Client)
+	tunnel, err := h2.NewTunnelClient(ssnc.Client)
 	if err != nil {
 		log.Fatal().Err(err).Msg("ConnectTunnel")
 	}

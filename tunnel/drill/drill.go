@@ -1,64 +1,104 @@
 package drill
 
 import (
-	"fmt"
-	"io"
 	"net/http"
-	"sync"
+	"net/url"
+	"time"
 
+	"github.com/google/uuid"
+	"github.com/mabels/steinstuecken/tunnel/copy_handler"
 	"github.com/mabels/steinstuecken/tunnel/endpoint"
 	"github.com/mabels/steinstuecken/tunnel/h2"
 
 	"github.com/rs/zerolog/log"
 )
 
+type DrillTime struct {
+	Start   time.Time
+	Connect time.Time
+	InCopy  time.Time
+	OutCopy time.Time
+	Total   time.Time
+}
+
 func Connect(tunnel *h2.Tunnel, ep endpoint.Bound) error {
 	active := true
 	for active {
 		var conn endpoint.Conn
 		conn, active = <-ep.Connections
+		dt := DrillTime{Start: time.Now()}
 		go func() {
+			connId := uuid.NewString()
 			defer conn.Conn.Close()
-			var err error
-			url := fmt.Sprintf("%s?ep=%s&src=%s", tunnel.Config.UpStreamUrl, ep.ListenParam.Name, conn.Conn.RemoteAddr().String())
-			// url := tunnel.Config.UpStreamUrl
-			tunnel.Conn, tunnel.Resp, err = tunnel.Client.Connect(tunnel.Ctx, url)
+			// var err error
+			url, err := url.Parse(tunnel.Config.UpStreamUrl)
 			if err != nil {
-				log.Error().Err(err).Msg("h2conn.Connect")
+				log.Error().Str("Component", "drill").Str("url", tunnel.Config.UpStreamUrl).Str("connId", connId).Err(err).Msg("url.Parse")
+				return
+			}
+			qry := url.Query()
+			qry.Add("connId", connId)
+			qry.Add("exitId", ep.ListenParam.Name)
+			url.RawQuery = qry.Encode()
+
+			tunnel.Conn, tunnel.Resp, err = tunnel.Client.Connect(tunnel.Ctx, url.String())
+			if err != nil {
+				log.Error().Str("Component", "drill").Err(err).Msg("h2conn.Connect")
 				return
 			}
 			defer tunnel.Conn.Close()
+			dt.Connect = time.Now()
+			log.Info().Str("Component", "drill").Str("ExitId", ep.ListenParam.Name).Str("ConnId", connId).
+				TimeDiff("Time", dt.Start, dt.Connect).Msg("Connect")
 			// Check server status code
 			if tunnel.Resp.StatusCode != http.StatusOK {
-				log.Error().Msgf("Bad status code: %d", tunnel.Resp.StatusCode)
+				log.Error().Str("Component", "drill").Str("ExitId", ep.ListenParam.Name).Str("ConnId", connId).Msgf("Bad status code: %d", tunnel.Resp.StatusCode)
 				return
 			}
-			wg := sync.WaitGroup{}
-			var upStreamWritten, downStreamWritten int64
-			wg.Add(1)
+			out := make(chan copy_handler.ResultCopy, 2)
 			go func() {
-				upStreamWritten, err = io.Copy(tunnel.Conn, conn.Conn)
-				if err != nil {
-					wg.Done()
-				} else {
-					wg.Add(-1)
+				ch := copy_handler.CopyHandler{
+					ExitId: ep.ListenParam.Name,
+					ConnId: connId,
+					Addr:   url.String(),
+					Buf:    make([]byte, tunnel.Config.BufferSize()),
 				}
+				result := ch.Copy(tunnel.Conn, conn.Conn)
+				out <- result
+				dt.InCopy = time.Now()
+				log.Info().Str("Component", "drill").
+					Str("ExitId", ep.ListenParam.Name).Str("ConnId", connId).
+					Err(result.Error).
+					Int64("UpStreamWritten", result.Written).
+					TimeDiff("Time", dt.Connect, dt.InCopy).Msg("InCopy Done")
 			}()
-			wg.Add(1)
 			go func() {
-				downStreamWritten, err = io.Copy(conn.Conn, tunnel.Conn)
-				if err != nil {
-					wg.Done()
-				} else {
-					wg.Add(-1)
+				ch := copy_handler.CopyHandler{
+					ExitId: ep.ListenParam.Name,
+					ConnId: connId,
+					Addr:   url.String(),
+					Buf:    make([]byte, tunnel.Config.BufferSize()),
 				}
+				result := ch.Copy(conn.Conn, tunnel.Conn)
+				out <- result
+				dt.OutCopy = time.Now()
+				log.Info().Str("Component", "drill").
+					Str("ExitId", ep.ListenParam.Name).Str("ConnId", connId).
+					Err(result.Error).
+					Int64("DownStreamWritten", result.Written).
+					TimeDiff("Time", dt.OutCopy, dt.Connect).Msg("OutCopy Done")
 			}()
-			wg.Wait()
-			if err != nil {
-				log.Error().Err(err).Msg(url)
-				return
+			select {
+			case result, done := <-out:
+				if !done {
+				}
 			}
-			log.Info().Int64("upStreamWritten", upStreamWritten).Int64("downStreamWritten", downStreamWritten).Msg(url)
+			dt.Total = time.Now()
+			log.Info().
+				Str("Component", "drill").
+				Str("ExitId", ep.ListenParam.Name).Str("ConnId", connId).
+				Int64("totalTransfered", upStreamWritten+downStreamWritten).
+				TimeDiff("Time", dt.Start, dt.Total).Msg("Done")
 		}()
 	}
 	return nil

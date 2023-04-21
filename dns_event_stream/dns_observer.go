@@ -1,30 +1,30 @@
-package observer
+package dns_event_stream
 
 import (
-	"time"
 	"fmt"
 	"log"
 	"os"
-	"sync"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/mabels/steinstuecken/resolvers"
 )
 
-type Subject struct {
-	Name string
-	Resolver resolvers.Resolver
+type XSubject struct {
+	Name       string
+	Resolver   resolvers.Resolver
 	LastUpdate time.Time
 }
 
 type DNSObserver struct {
-	resolver resolvers.Resolver
-	results chan resolvers.Result
+	resolver     resolvers.Resolver
+	results      chan resolvers.Result
 	mutexSubject sync.Mutex
-	subjects map[string]Subject
-	running bool
-	logger *log.Logger
+	subjects     map[string]XSubject
+	running      bool
+	logger       *log.Logger
 }
 
 func NewDNSObserver(logs ...*log.Logger) (*DNSObserver, error) {
@@ -37,25 +37,24 @@ func NewDNSObserver(logs ...*log.Logger) (*DNSObserver, error) {
 	}
 	return &DNSObserver{
 		results:  make(chan resolvers.Result, 16),
-		subjects: make(map[string]Subject),
+		subjects: make(map[string]XSubject),
 		logger:   logger,
 	}, nil
 }
 
-
-func (o *DNSObserver) AddSubject(name string, resolver resolvers.Resolver) Subject {
+func (o *DNSObserver) AddSubject(name string, resolver resolvers.Resolver) XSubject {
 	o.mutexSubject.Lock()
 	defer o.mutexSubject.Unlock()
-	o.subjects[name] = Subject{
-		Name: name,
-		Resolver: resolver,
+	o.subjects[name] = XSubject{
+		Name:       name,
+		Resolver:   resolver,
 		LastUpdate: time.Now(),
 	}
 	o.logger.Printf("Added subject %v", o.subjects[name])
 	return o.subjects[name]
 }
 
-func (o *DNSObserver) RemoveSubject(name string) *Subject {
+func (o *DNSObserver) RemoveSubject(name string) *XSubject {
 	o.mutexSubject.Lock()
 	defer o.mutexSubject.Unlock()
 	ret, found := o.subjects[name]
@@ -67,23 +66,23 @@ func (o *DNSObserver) RemoveSubject(name string) *Subject {
 	return &ret
 }
 
-type subjectSorted []Subject
+type subjectSorted []XSubject
 
 func (sk subjectSorted) Len() int {
-        return len(sk)
+	return len(sk)
 }
 
 func (sk subjectSorted) Swap(i, j int) {
-        (sk)[i], (sk)[j] = (sk)[j], (sk)[i]
+	(sk)[i], (sk)[j] = (sk)[j], (sk)[i]
 }
 
 func (sk subjectSorted) Less(i, j int) bool {
-        return strings.Compare((sk)[i].Name, (sk)[j].Name) < 0
+	return strings.Compare((sk)[i].Name, (sk)[j].Name) < 0
 }
 
-func (o *DNSObserver) GetSubjects() []Subject {
+func (o *DNSObserver) GetSubjects() []XSubject {
 	o.mutexSubject.Lock()
-	subjects := make([]Subject, 0, len(o.subjects))
+	subjects := make([]XSubject, 0, len(o.subjects))
 	for _, subject := range o.subjects {
 		subjects = append(subjects, subject)
 	}
@@ -107,7 +106,7 @@ func (o *DNSObserver) Start() error {
 		time.Sleep(wait)
 	}
 	o.logger.Printf("Stopped observer")
-	return nil 
+	return nil
 }
 
 func (o *DNSObserver) Stop() error {

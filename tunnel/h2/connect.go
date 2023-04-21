@@ -24,7 +24,7 @@ type Tunnel struct {
 	Config config.SsnConfigClient
 }
 
-func ConnectTunnel(ssnc config.SsnConfigClient) (tunnel Tunnel, err error) {
+func NewTunnelClient(ssnc config.SsnConfigClient) (tunnel Tunnel, err error) {
 	tunnel.Config = ssnc
 	var certs tls.Certificate
 	certs, err = tls.LoadX509KeyPair(ssnc.CertFile, ssnc.KeyFile)
