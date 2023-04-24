@@ -1,11 +1,13 @@
 package dns_event_stream
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"os"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -31,10 +33,14 @@ func TestSysResolverSubject(t *testing.T) {
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
-	_, err = des.AddSubject(&srs)
-	if err != nil {
-		t.Fatalf("add: %v", err)
-	}
+	bounds := [][]*DnsResult{}
+	des.Bind(&srs, func(history []*DnsResult) {
+		bounds = append(bounds, history)
+	})
+	// _, err = des.CreateSubject(&srs)
+	// if err != nil {
+	// 	t.Fatalf("add: %v", err)
+	// }
 	rrs, err := des.Resolve(&srs)
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
@@ -45,8 +51,16 @@ func TestSysResolverSubject(t *testing.T) {
 	if !strings.HasSuffix(rrs[0].String(), "dns.google.") {
 		t.Errorf("%s != 8.8.8.8.in-addr.arpa.\t66354\tIN\tPTR\tdns.google.", rrs[0].String())
 	}
-
 	des.Stop()
+	if len(bounds) != 1 {
+		t.Error("len(bounds) != 1")
+	}
+	if bounds[0][0].ResolveTime < time.Millisecond {
+		t.Errorf("bounds[0][0].ResolveTime < time.Millisecond")
+	}
+	if time.Now().Sub(bounds[0][0].Created) > 5*time.Second {
+		t.Errorf("time.Now().Sub(bounds[0][0].Created) > 5*time.Second")
+	}
 }
 
 func TestDnsEventStream(t *testing.T) {
@@ -60,7 +74,7 @@ func TestDnsEventStream(t *testing.T) {
 			Name: fmt.Sprintf("www.adviser.com"),
 		},
 	}
-	_, err = des.AddSubject(&sub)
+	_, err = des.CreateSubject(&sub)
 	if err.Error() != "not started" {
 		t.Fatal(err)
 	}
@@ -84,11 +98,11 @@ func TestDnsEventStream(t *testing.T) {
 			},
 		}
 		var as, das *ActiveSubject
-		as, err = des.AddSubject(&sub)
+		as, err = des.CreateSubject(&sub)
 		if err != nil {
 			t.Fatal(err)
 		}
-		das, err = des.AddSubject(&sub)
+		das, err = des.CreateSubject(&sub)
 		if err != nil {
 			t.Fatalf("das, err = des.AddSubject(&sub) %v", err)
 		}
@@ -276,16 +290,16 @@ func (ts *testSubject) Key() dns.Question {
 }
 
 func (ts *testSubject) Resolve() ([]dns.RR, error) {
-	ts.calls.resolve++
-	ts.ensureLog().Debug().Msgf("resolve %d", ts.calls.resolve/3)
+	// ts.ensureLog().Debug().Msgf("resolve %d/%d", ts.calls.resolve, ts.calls.resolve/3)
 	ttl := 10
 	if ts.doTtl {
-		ttl = ts.calls.resolve
+		ttl = ts.calls.resolve + 1
 	}
-	ts.ensureLog().Debug().Msgf("resolve %d-%d:%d", ttl, ts.calls.resolve, ts.calls.resolve/3)
 	my := new(dns.A)
 	my.Hdr = dns.RR_Header{Name: "test", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: uint32(ttl)}
 	my.A = net.ParseIP(fmt.Sprintf("%d.0.0.0", ts.calls.resolve/3))
+	ts.ensureLog().Debug().Msgf("backend-resolve %d-%d:%d->%s", ttl, ts.calls.resolve, ts.calls.resolve/3, my.A.String())
+	ts.calls.resolve++
 	rrs := make([]dns.RR, 1)
 	rrs[0] = my
 	return rrs, ts.err
@@ -309,8 +323,8 @@ func TestActiveResolve(t *testing.T) {
 		t.Error(err)
 	}
 
-	var bound []*dnsResult
-	as.Bind(func(history []*dnsResult) {
+	var bound []*DnsResult
+	as.Bind(func(history []*DnsResult) {
 		bound = history
 	})
 
@@ -325,14 +339,14 @@ func TestActiveResolve(t *testing.T) {
 		}
 	}()
 	rs := as.Resolve()
-	if len(rs.rrs) != 1 {
-		t.Fatalf("rrs should be 1: %v", len(rs.rrs))
+	if len(rs.Rrs) != 1 {
+		t.Fatalf("rrs should be 1: %v", len(rs.Rrs))
 	}
-	if rs.rrs[0].String() != "test	10	IN	A	0.0.0.0" {
-		t.Errorf("rrs should be test. 10 IN A: %v", rs.rrs[0].String())
+	if rs.Rrs[0].String() != "test	10	IN	A	0.0.0.0" {
+		t.Errorf("rrs should be test. 10 IN A: %v", rs.Rrs[0].String())
 	}
-	if rs.err != nil {
-		t.Errorf("err should be nil:%v", rs.err)
+	if rs.Err != nil {
+		t.Errorf("err should be nil:%v", rs.Err)
 	}
 	if len(as.history) != 1 {
 		t.Error("history should be 1")
@@ -343,8 +357,20 @@ func TestActiveResolve(t *testing.T) {
 }
 
 type mockTime struct {
-	nows   []time.Time
-	sleeps []time.Duration
+	nows         []time.Time
+	sleeps       []time.Duration
+	sleepAfter   int
+	releaseDelay chan int
+	sleepWait    sync.WaitGroup
+	sysTime      sysTime
+}
+
+func newMockTime(mt mockTime) *mockTime {
+	rt := mt
+	rt.sleepWait = sync.WaitGroup{}
+	rt.sleepWait.Add(1)
+	rt.releaseDelay = make(chan int, 1)
+	return &rt
 }
 
 func (mt *mockTime) Now() time.Time {
@@ -355,18 +381,24 @@ func (mt *mockTime) Now() time.Time {
 	return mt.nows[len(mt.nows)-1]
 }
 
-func (mt *mockTime) Sleep(d time.Duration) {
+func (mt *mockTime) Delay(ctx context.Context, d time.Duration) error {
 	if mt.sleeps == nil {
 		mt.sleeps = []time.Duration{}
 	}
 	mt.sleeps = append(mt.sleeps, d)
-	time.Sleep(10 * time.Millisecond)
+	<-mt.releaseDelay
+	// mt.delayCalled <- len(mt.sleeps)
+	if len(mt.sleeps) >= mt.sleepAfter {
+		mt.sleepWait.Done()
+		return mt.sysTime.Delay(ctx, time.Hour)
+	}
+	return nil
 }
 
 func TestUnshift(t *testing.T) {
-	history := make([]*dnsResult, 0, 4)
+	history := make([]*DnsResult, 0, 4)
 	for i := 0; i < 8; i++ {
-		out := unshiftMax(&dnsResult{rrs: []dns.RR{&dns.A{
+		out := unshiftMax(&DnsResult{Rrs: []dns.RR{&dns.A{
 			Hdr: dns.RR_Header{
 				Name:   "test",
 				Rrtype: dns.TypeA,
@@ -387,8 +419,8 @@ func TestUnshift(t *testing.T) {
 		j := 0
 		for k := len(history) - 1; k >= 0; k-- {
 			should := fmt.Sprintf("test	%d	IN	A	%d.0.0.0", i-j, i-j)
-			if history[j].rrs[0].String() != should {
-				t.Errorf("rrs should be %d:%d:%d:[%v]==[%v]", len(history), k, i, history[j].rrs[0].String(), should)
+			if history[j].Rrs[0].String() != should {
+				t.Errorf("rrs should be %d:%d:%d:[%v]==[%v]", len(history), k, i, history[j].Rrs[0].String(), should)
 			}
 			j++
 		}
@@ -400,7 +432,9 @@ func TestActiveBind(t *testing.T) {
 		doTtl:    true,
 		question: dns.Question{Name: "test", Qtype: dns.TypeA, Qclass: dns.ClassINET},
 	}
-	mockTime := &mockTime{}
+	mockTime := newMockTime(mockTime{
+		sleepAfter: 10,
+	})
 	zlog := zerolog.New(os.Stderr).With().Timestamp().Logger()
 	as, err := NewActiveSubject(&ts, &DnsEventStream{
 		historyLimit: 3,
@@ -416,27 +450,28 @@ func TestActiveBind(t *testing.T) {
 		t.Error(err)
 	}
 
-	bounds := [][]*dnsResult{}
-	as.Bind(func(history []*dnsResult) {
+	bounds := [][]*DnsResult{}
+	as.Bind(func(history []*DnsResult) {
 		bounds = append(bounds, history)
 		out := make([][]string, 0, len(bounds))
 		for _, bs := range bounds {
 			bsStrs := make([]string, len(bs))
 			for _, b := range bs {
-				for _, r := range b.rrs {
+				for _, r := range b.Rrs {
 					bsStrs = append(bsStrs, r.String())
 				}
 			}
 			out = append(out, bsStrs)
 		}
 		zlog.Debug().Msgf("bound: %v:%v", out, history)
+		mockTime.releaseDelay <- 1
 	})
 
 	err = as.Activate()
 	if err != nil {
 		t.Errorf("err should be nil: %v", err)
 	}
-	time.Sleep(time.Millisecond * 105)
+	mockTime.sleepWait.Wait()
 	err = as.Deactivate()
 	if err != nil {
 		t.Errorf("err should be nil: %v", err)
@@ -452,10 +487,10 @@ func TestActiveBind(t *testing.T) {
 			t.Errorf("should be %v: %v", i+1, len(b))
 		}
 		for j, r := range b {
-			x := (1 + i) - j
-			should := fmt.Sprintf("test	%d	IN	A	%d.0.0.0", x, x/3)
-			if r.rrs[0].String() != should {
-				t.Errorf("should be %d:%d:%d [%v]:[%v]", i, j, len(b), should, r.rrs[0].String())
+			x := i - j
+			should := fmt.Sprintf("test	%d	IN	A	%d.0.0.0", x+1, x/3)
+			if r.Rrs[0].String() != should {
+				t.Errorf("should be %d:%d:%d [%v]:[%v]", i, j, len(b), should, r.Rrs[0].String())
 			}
 		}
 	}
@@ -482,7 +517,10 @@ func TestActiveBind(t *testing.T) {
 func TestDnsEventStreamRunning(t *testing.T) {
 	zlog := zerolog.New(os.Stderr).With().Timestamp().Logger()
 	des := NewDnsEventStream(&zlog)
-	des.timeIf = &mockTime{}
+	ptrMockTime := newMockTime(mockTime{
+		sleepAfter: 10,
+	})
+	des.timeIf = ptrMockTime
 	des.waitResolve = 3 * time.Millisecond
 	// des.
 
@@ -490,37 +528,51 @@ func TestDnsEventStreamRunning(t *testing.T) {
 	if err != nil {
 		t.Errorf("err should be nil: %v", err)
 	}
-	defer des.Stop()
-
 	ts := testSubject{
 		question: dns.Question{Name: "test", Qtype: dns.TypeA, Qclass: dns.ClassINET},
 	}
+	as, err := des.CreateSubject(&ts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	as.doneBackendResolve = make(chan []*DnsResult, 1)
 	bounds := []string{}
-	_, err = des.Bind(&ts, func(history []*dnsResult) {
-		bounds = append(bounds, history[0].rrs[0].String())
+	_, err = des.Bind(&ts, func(history []*DnsResult) {
+		bounds = append(bounds, history[0].Rrs[0].String())
 	})
+	if err != nil {
+		t.Errorf("err should be nil: %v", err)
+	}
+	err = as.Activate()
 	if err != nil {
 		t.Errorf("err should be nil: %v", err)
 	}
 	out := make([]string, 0, 10)
 	for i := 0; i < 10; i++ {
-		rrs, err := des.Resolve(&ts)
-		if err != nil {
-			t.Errorf("err should be nil: %v", err)
+		refRrs := <-as.doneBackendResolve
+		// t.Logf("TestDnsEventStreamRunning:pre:%d", i)
+		// t.Logf("TestDnsEventStreamRunning:post:%d", called)
+		// var refRrs []dns.RR
+		for i := 0; i < 10; i++ {
+			rrs, err := des.Resolve(&ts)
+			if err != nil {
+				t.Errorf("err should be nil: %v", err)
+			}
+			if !reflect.DeepEqual(rrs, refRrs[0].Rrs) {
+				t.Errorf("rrs should equal %v==%v", rrs, refRrs)
+			}
+
 		}
-		if len(rrs) != 1 {
-			t.Errorf("rrs should be 1: %v", len(rrs))
-		}
-		out = append(out, rrs[0].String())
-		time.Sleep(10500 * time.Microsecond)
+		out = append(out, refRrs[0].Rrs[0].String())
+		ptrMockTime.releaseDelay <- 1
 	}
+	ptrMockTime.sleepWait.Wait()
 	des.Stop()
-	time.Sleep(22 * time.Millisecond)
 	if !reflect.DeepEqual(out, []string{
-		"test	10	IN	A	0.0.0.0", "test	10	IN	A	0.0.0.0",
+		"test	10	IN	A	0.0.0.0", "test	10	IN	A	0.0.0.0", "test	10	IN	A	0.0.0.0",
 		"test	10	IN	A	1.0.0.0", "test	10	IN	A	1.0.0.0", "test	10	IN	A	1.0.0.0",
 		"test	10	IN	A	2.0.0.0", "test	10	IN	A	2.0.0.0", "test	10	IN	A	2.0.0.0",
-		"test	10	IN	A	3.0.0.0", "test	10	IN	A	3.0.0.0",
+		"test	10	IN	A	3.0.0.0",
 	}) {
 		t.Errorf("out should be same: %v", out)
 	}

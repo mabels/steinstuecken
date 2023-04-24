@@ -1,6 +1,7 @@
 package dns_event_stream
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"time"
@@ -36,14 +37,16 @@ type Subject interface {
 }
 
 type ActiveSubject struct {
-	Subject        Subject
-	Log            *zerolog.Logger
-	activated      bool
-	askBackend     sync.Mutex
-	history        []*dnsResult
-	dnsEventStream *DnsEventStream
-	isWaiting      bool
-	boundFn        map[string]func(history []*dnsResult)
+	Subject            Subject
+	Log                *zerolog.Logger
+	activated          bool
+	askBackend         sync.Mutex
+	history            []*DnsResult
+	dnsEventStream     *DnsEventStream
+	isWaiting          bool
+	cancelFn           func()
+	doneBackendResolve chan []*DnsResult
+	boundFns           map[string]func(history []*DnsResult)
 }
 
 func NewActiveSubject(subject Subject, dnsEventStream *DnsEventStream) (*ActiveSubject, error) {
@@ -61,18 +64,18 @@ func NewActiveSubject(subject Subject, dnsEventStream *DnsEventStream) (*ActiveS
 	return as, nil
 }
 
-func (as *ActiveSubject) Bind(fn func(history []*dnsResult)) func() {
-	if as.boundFn == nil {
-		as.boundFn = make(map[string]func(history []*dnsResult))
+func (as *ActiveSubject) Bind(fn func(history []*DnsResult)) func() {
+	if as.boundFns == nil {
+		as.boundFns = make(map[string]func(history []*DnsResult))
 	}
 	id := uuid.NewString()
-	as.boundFn[id] = fn
+	as.boundFns[id] = fn
 	return func() {
-		delete(as.boundFn, id)
+		delete(as.boundFns, id)
 	}
 }
 
-func unshift(new *dnsResult, history []*dnsResult) []*dnsResult {
+func unshift(new *DnsResult, history []*DnsResult) []*DnsResult {
 	for i := len(history) - 1; i > 0; i-- {
 		history[i] = history[i-1]
 	}
@@ -80,12 +83,12 @@ func unshift(new *dnsResult, history []*dnsResult) []*dnsResult {
 	return history
 }
 
-func unshiftMax(new *dnsResult, history []*dnsResult, max int) []*dnsResult {
+func unshiftMax(new *DnsResult, history []*DnsResult, max int) []*DnsResult {
 	if max < 1 {
 		max = 1
 	}
 	if history == nil {
-		history = make([]*dnsResult, 0, max)
+		history = make([]*DnsResult, 0, max)
 	}
 	if len(history) < max {
 		history = append(history, new)
@@ -100,17 +103,19 @@ func (as *ActiveSubject) Refresh() {
 	}
 	as.askBackend.Lock()
 
-	dnsrr := dnsResult{
-		created: as.dnsEventStream.time().Now(),
+	dnsrr := DnsResult{
+		Created: as.dnsEventStream.time().Now(),
 	}
 	if as.history == nil {
-		as.history = make([]*dnsResult, 0, as.dnsEventStream.historyLimit)
+		as.history = make([]*DnsResult, 0, as.dnsEventStream.historyLimit)
 	}
-	dnsrr.rrs, dnsrr.err = as.Subject.Resolve()
+	startTime := time.Now()
+	dnsrr.Rrs, dnsrr.Err = as.Subject.Resolve()
+	dnsrr.ResolveTime = time.Since(startTime)
 	invokeBounds := false
 	ai := []actionItem{}
 	if len(as.history) > 0 {
-		ai = toActions(dnsrr.rrs, as.history[0].rrs)
+		ai = toActions(dnsrr.Rrs, as.history[0].Rrs)
 	}
 	if len(as.history) == 0 {
 		as.ensureLog().Debug().Msgf("init actions: %v", ai)
@@ -122,8 +127,8 @@ func (as *ActiveSubject) Refresh() {
 		invokeBounds = true
 	}
 	refreshTime := time.Second
-	if dnsrr.err == nil && len(dnsrr.rrs) > 0 {
-		refreshTime = time.Duration(dnsrr.rrs[0].Header().Ttl) * time.Second
+	if dnsrr.Err == nil && len(dnsrr.Rrs) > 0 {
+		refreshTime = time.Duration(dnsrr.Rrs[0].Header().Ttl) * time.Second
 		if refreshTime > as.dnsEventStream.refreshTimes.overlay {
 			refreshTime -= as.dnsEventStream.refreshTimes.overlay
 		}
@@ -136,42 +141,61 @@ func (as *ActiveSubject) Refresh() {
 		refreshTime = as.dnsEventStream.refreshTimes.max
 	}
 	if !as.isWaiting {
+		var ctx context.Context
+		ctx, as.cancelFn = context.WithCancel(context.Background())
 		as.isWaiting = true
 		go func() {
-			as.dnsEventStream.time().Sleep(refreshTime)
-			as.ensureLog().Debug().Dur("refreshing in ", refreshTime)
+			ret := as.dnsEventStream.timeIf.Delay(ctx, refreshTime)
 			as.isWaiting = false
-			as.Refresh()
+			as.cancelFn = nil
+			if ret == nil {
+				// as.dnsEventStream.time().Sleep(refreshTime)
+				as.ensureLog().Debug().Dur("refreshing in ", refreshTime)
+				as.Refresh()
+			}
 		}()
 	}
-	my := make([]*dnsResult, len(as.history))
+	my := make([]*DnsResult, len(as.history))
 	copy(my, as.history)
 	defer as.askBackend.Unlock()
+	if as.doneBackendResolve != nil {
+		as.doneBackendResolve <- my
+	}
 	if invokeBounds {
-		for _, fn := range as.boundFn {
+		for _, fn := range as.boundFns {
 			fn(my)
 		}
 	}
 }
 
-func (as *ActiveSubject) Resolve() dnsResult {
+func (as *ActiveSubject) Resolve() DnsResult {
+	// the start of the go routine makes the test flaky
+	// if !as.activated {
+	// 	go func() {
+	// 		err := as.Activate()
+	// 		if err != nil {
+	// 			as.ensureLog().Warn().Err(err).Msg("activate failed")
+	// 		}
+	// 	}()
+	// }
+
 	if !as.activated {
-		return dnsResult{
-			err: fmt.Errorf("subject not activated: %s", keySubject(as.Subject.Key())),
+		return DnsResult{
+			Err: fmt.Errorf("subject not activated: %s", keySubject(as.Subject.Key())),
 		}
 	}
 	as.askBackend.Lock()
 	defer as.askBackend.Unlock()
-	dnsrr := dnsResult{
+	dnsrr := DnsResult{
 		// err:     fmt.Errorf("no history: %s", keySubject(as.Subject.Key())),
-		created: as.dnsEventStream.time().Now(),
+		Created: as.dnsEventStream.time().Now(),
 	}
 	if len(as.history) > 0 {
 		// return latest error and first data from history
-		dnsrr.err = as.history[0].err
+		dnsrr.Err = as.history[0].Err
 		for _, rr := range as.history {
-			if len(rr.rrs) > 0 {
-				dnsrr.rrs = rr.rrs
+			if len(rr.Rrs) > 0 {
+				dnsrr.Rrs = rr.Rrs
 				break
 			}
 		}
@@ -193,8 +217,11 @@ func (as *ActiveSubject) Deactivate() error {
 	if !as.activated {
 		return fmt.Errorf("subject not activated: %s", keySubject(as.Subject.Key()))
 	}
+	if as.cancelFn != nil {
+		as.cancelFn()
+	}
 	as.activated = false
-	as.boundFn = make(map[string]func(history []*dnsResult))
+	as.boundFns = make(map[string]func(history []*DnsResult))
 	as.ensureLog().Info().Msg("Deactivate")
 	return nil
 }

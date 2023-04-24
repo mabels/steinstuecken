@@ -1,6 +1,7 @@
 package dns_event_stream
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"sync"
@@ -12,10 +13,11 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-type dnsResult struct {
-	rrs     []dns.RR
-	err     error
-	created time.Time
+type DnsResult struct {
+	Rrs         []dns.RR
+	Err         error
+	Created     time.Time
+	ResolveTime time.Duration
 }
 
 type RefreshTimes struct {
@@ -55,13 +57,21 @@ func (s *sysTime) Now() time.Time {
 	return time.Now()
 }
 
-func (s *sysTime) Sleep(d time.Duration) {
-	time.Sleep(d)
+func (s *sysTime) Delay(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	select {
+	case <-ctx.Done():
+		t.Stop()
+		return fmt.Errorf("Interrupted")
+	case <-t.C:
+	}
+	return nil
 }
 
 type timeInterface interface {
 	Now() time.Time
-	Sleep(time.Duration)
+	// Sleep(time.Duration)
+	Delay(ctx context.Context, d time.Duration) error
 }
 
 func (d *DnsEventStream) time() timeInterface {
@@ -88,14 +98,16 @@ func (s *DnsEventStream) Stop() error {
 	s.activeLock.Lock()
 	defer s.activeLock.Unlock()
 	for _, as := range s.activeSubjects {
-		as.Deactivate()
+		if as.activated {
+			as.Deactivate()
+		}
 	}
 	s.started = false
 	s.log.Info().Msg("Stop")
 	return nil
 }
 
-func (s *DnsEventStream) AddSubject(sub Subject) (*ActiveSubject, error) {
+func (s *DnsEventStream) CreateSubject(sub Subject) (*ActiveSubject, error) {
 	if !s.started {
 		err := fmt.Errorf("not started")
 		s.log.Error().Err(err)
@@ -110,7 +122,7 @@ func (s *DnsEventStream) AddSubject(sub Subject) (*ActiveSubject, error) {
 		var found bool
 		as, found = s.activeSubjects[key]
 		if found {
-			aslog.Info().Msg("already added")
+			// aslog.Debug().Msg("already added")
 			return as, nil
 		}
 		as = &ActiveSubject{
@@ -122,12 +134,6 @@ func (s *DnsEventStream) AddSubject(sub Subject) (*ActiveSubject, error) {
 		as.Subject.ConnectActiveSubject(as)
 	}
 	s.log.Info().Str("subject", key).Msg("added")
-	go func() {
-		err := as.Activate()
-		if err != nil {
-			aslog.Warn().Err(err).Msg("activate failed")
-		}
-	}()
 	return as, nil
 }
 
@@ -138,38 +144,38 @@ func (s *DnsEventStream) RemoveSubject(q dns.Question) error {
 	key := keySubject(q)
 	s.activeLock.Lock()
 	defer s.activeLock.Unlock()
-	as, found := s.activeSubjects[key]
+	_, found := s.activeSubjects[key]
 	if !found {
 		err := fmt.Errorf("subject not found: %s", key)
 		s.log.Error().Err(err)
 		return err
 	}
-	err := as.Deactivate()
-	if err != nil {
-		return err
-	}
+	// err := as.Deactivate()
+	// if err != nil {
+	// 	return err
+	// }
 	delete(s.activeSubjects, key)
 	s.log.Info().Str("subject", key).Msg("removed")
 	return nil
 }
 
-func (s *DnsEventStream) createActiveSubject(sub Subject) (bool, *ActiveSubject, error) {
-	key := keySubject(sub.Key())
-	s.activeLock.Lock()
-	as, found := s.activeSubjects[key]
-	s.activeLock.Unlock()
-	if !found {
-		var err error
-		as, err = s.AddSubject(sub)
-		if as == nil && err != nil {
-			return !found, nil, err
-		}
-	}
-	return !found, as, nil
-}
+// func (s *DnsEventStream) createActiveSubject(sub Subject, acFn func(as *ActiveSubject)) (bool, *ActiveSubject, error) {
+// 	key := keySubject(sub.Key())
+// 	s.activeLock.Lock()
+// 	as, found := s.activeSubjects[key]
+// 	s.activeLock.Unlock()
+// 	if !found {
+// 		var err error
+// 		as, err = s.AddSubject(sub)
+// 		if as == nil && err != nil {
+// 			return !found, nil, err
+// 		}
+// 	}
+// 	return !found, as, nil
+// }
 
-func (s *DnsEventStream) Bind(sub Subject, fn func(history []*dnsResult)) (func(), error) {
-	_, as, err := s.createActiveSubject(sub)
+func (s *DnsEventStream) Bind(sub Subject, fn func(history []*DnsResult)) (func(), error) {
+	as, err := s.CreateSubject(sub)
 	if err != nil {
 		return nil, err
 	}
@@ -177,23 +183,26 @@ func (s *DnsEventStream) Bind(sub Subject, fn func(history []*dnsResult)) (func(
 }
 
 func (s *DnsEventStream) Resolve(sub Subject) ([]dns.RR, error) {
-	_, as, err := s.createActiveSubject(sub)
+	as, err := s.CreateSubject(sub)
 	if err != nil {
 		return nil, err
+	}
+	if !as.activated {
+		as.Activate()
 	}
 	dnsrr := as.Resolve()
 	if s.waitResolve == 0 {
 		s.waitResolve = 100 * time.Millisecond
 	}
-	if dnsrr.err != nil && strings.HasPrefix(dnsrr.err.Error(), "subject not activated:") {
+	if dnsrr.Err != nil && strings.HasPrefix(dnsrr.Err.Error(), "subject not activated:") {
 		s.log.Info().Str("subject", keySubject(sub.Key())).Msg("waiting for activation")
 		time.Sleep(s.waitResolve)
 		dnsrr = as.Resolve()
 	}
-	for ; dnsrr.err == nil && len(dnsrr.rrs) == 0; time.Sleep(s.waitResolve) {
+	for ; dnsrr.Err == nil && len(dnsrr.Rrs) == 0; time.Sleep(s.waitResolve) {
 		s.log.Info().Str("subject", keySubject(sub.Key())).Msg("waiting for results")
 		// there should be a better way to do this
 		dnsrr = as.Resolve()
 	}
-	return dnsrr.rrs, dnsrr.err
+	return dnsrr.Rrs, dnsrr.Err
 }
