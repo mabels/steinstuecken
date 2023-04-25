@@ -107,13 +107,21 @@ func (s *DnsEventStream) Stop() error {
 	return nil
 }
 
+func (s *DnsEventStream) HistoryLimit() int {
+	if s.historyLimit == 0 {
+		s.historyLimit = 5
+		return 5
+	}
+	return s.historyLimit
+}
+
 func (s *DnsEventStream) CreateSubject(sub Subject) (*ActiveSubject, error) {
 	if !s.started {
 		err := fmt.Errorf("not started")
 		s.log.Error().Err(err)
 		return nil, err
 	}
-	key := keySubject(sub.Key())
+	key := KeySubject(sub.Key())
 	aslog := s.log.With().Str("subject", key).Logger()
 	var as *ActiveSubject
 	{
@@ -141,7 +149,7 @@ func (s *DnsEventStream) RemoveSubject(q dns.Question) error {
 	if !s.started {
 		return fmt.Errorf("not started")
 	}
-	key := keySubject(q)
+	key := KeySubject(q)
 	s.activeLock.Lock()
 	defer s.activeLock.Unlock()
 	_, found := s.activeSubjects[key]
@@ -195,12 +203,12 @@ func (s *DnsEventStream) Resolve(sub Subject) ([]dns.RR, error) {
 		s.waitResolve = 100 * time.Millisecond
 	}
 	if dnsrr.Err != nil && strings.HasPrefix(dnsrr.Err.Error(), "subject not activated:") {
-		s.log.Info().Str("subject", keySubject(sub.Key())).Msg("waiting for activation")
+		s.log.Info().Str("subject", KeySubject(sub.Key())).Msg("waiting for activation")
 		time.Sleep(s.waitResolve)
 		dnsrr = as.Resolve()
 	}
 	for ; dnsrr.Err == nil && len(dnsrr.Rrs) == 0; time.Sleep(s.waitResolve) {
-		s.log.Info().Str("subject", keySubject(sub.Key())).Msg("waiting for results")
+		s.log.Info().Str("subject", KeySubject(sub.Key())).Msg("waiting for results")
 		// there should be a better way to do this
 		dnsrr = as.Resolve()
 	}

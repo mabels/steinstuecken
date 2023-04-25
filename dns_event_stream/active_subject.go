@@ -3,27 +3,30 @@ package dns_event_stream
 import (
 	"context"
 	"fmt"
+	"math"
+	"os"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/miekg/dns"
 	"github.com/rs/zerolog"
-	"github.com/rs/zerolog/log"
 )
 
-type actionItem struct {
-	action string
-	idx    int
+type ActionItem struct {
+	Action  string
+	Idx     int
+	Current dns.RR
+	Prev    dns.RR
 }
 
 func (as *ActiveSubject) ensureLog() *zerolog.Logger {
 	if as.Log == nil {
-		if !(as.dnsEventStream == nil && as.dnsEventStream.log == nil) {
+		if as.dnsEventStream != nil && as.dnsEventStream.log != nil {
 			my := as.dnsEventStream.log.With().Str("activeSubject", as.Subject.Key().Name).Logger()
 			as.Log = &my
 		} else {
-			my := log.With().Str("activeSubject", as.Subject.Key().Name).Logger()
+			my := zerolog.New(os.Stderr).With().Str("activeSubject", as.Subject.Key().Name).Logger()
 			as.Log = &my
 		}
 	}
@@ -107,28 +110,35 @@ func (as *ActiveSubject) Refresh() {
 		Created: as.dnsEventStream.time().Now(),
 	}
 	if as.history == nil {
-		as.history = make([]*DnsResult, 0, as.dnsEventStream.historyLimit)
+		as.history = make([]*DnsResult, 0, as.dnsEventStream.HistoryLimit())
 	}
 	startTime := time.Now()
 	dnsrr.Rrs, dnsrr.Err = as.Subject.Resolve()
 	dnsrr.ResolveTime = time.Since(startTime)
 	invokeBounds := false
-	ai := []actionItem{}
+	ai := []ActionItem{}
 	if len(as.history) > 0 {
-		ai = toActions(dnsrr.Rrs, as.history[0].Rrs)
+		last := LastValidHistory(as.history)
+		ai = ToActions(dnsrr.Rrs, last.Rrs)
 	}
 	if len(as.history) == 0 {
-		as.ensureLog().Debug().Msgf("init actions: %v", ai)
-		as.history = unshiftMax(&dnsrr, as.history, as.dnsEventStream.historyLimit)
+		as.history = unshiftMax(&dnsrr, as.history, as.dnsEventStream.HistoryLimit())
+		as.ensureLog().Debug().Any("history", as.history).Int("historyLen", len(as.history)).Msgf("init history: %v", ai)
 		invokeBounds = true
 	} else if len(ai) > 0 {
-		as.ensureLog().Debug().Msgf("actions: %v", ai)
-		as.history = unshiftMax(&dnsrr, as.history, as.dnsEventStream.historyLimit)
+		as.history = unshiftMax(&dnsrr, as.history, as.dnsEventStream.HistoryLimit())
+		as.ensureLog().Debug().Any("history", as.history).Int("historyLen", len(as.history)).Msgf("add history: %v", ai)
 		invokeBounds = true
 	}
 	refreshTime := time.Second
 	if dnsrr.Err == nil && len(dnsrr.Rrs) > 0 {
-		refreshTime = time.Duration(dnsrr.Rrs[0].Header().Ttl) * time.Second
+		nextTtl := math.MaxUint32
+		for _, rr := range dnsrr.Rrs {
+			if nextTtl > int(rr.Header().Ttl) {
+				nextTtl = int(rr.Header().Ttl)
+			}
+		}
+		refreshTime = time.Duration(nextTtl) * time.Second
 		if refreshTime > as.dnsEventStream.refreshTimes.overlay {
 			refreshTime -= as.dnsEventStream.refreshTimes.overlay
 		}
@@ -181,7 +191,7 @@ func (as *ActiveSubject) Resolve() DnsResult {
 
 	if !as.activated {
 		return DnsResult{
-			Err: fmt.Errorf("subject not activated: %s", keySubject(as.Subject.Key())),
+			Err: fmt.Errorf("subject not activated: %s", KeySubject(as.Subject.Key())),
 		}
 	}
 	as.askBackend.Lock()
@@ -205,7 +215,7 @@ func (as *ActiveSubject) Resolve() DnsResult {
 
 func (as *ActiveSubject) Activate() error {
 	if as.activated {
-		return fmt.Errorf("subject already activated: %s", keySubject(as.Subject.Key()))
+		return fmt.Errorf("subject already activated: %s", KeySubject(as.Subject.Key()))
 	}
 	as.ensureLog().Info().Msg("Activate")
 	as.activated = true
@@ -215,7 +225,7 @@ func (as *ActiveSubject) Activate() error {
 
 func (as *ActiveSubject) Deactivate() error {
 	if !as.activated {
-		return fmt.Errorf("subject not activated: %s", keySubject(as.Subject.Key()))
+		return fmt.Errorf("subject not activated: %s", KeySubject(as.Subject.Key()))
 	}
 	if as.cancelFn != nil {
 		as.cancelFn()

@@ -109,7 +109,7 @@ func TestDnsEventStream(t *testing.T) {
 		if as != das {
 			t.Errorf("as != das")
 		}
-		_, found := des.activeSubjects[keySubject(sub.Key())]
+		_, found := des.activeSubjects[KeySubject(sub.Key())]
 		if !found {
 			t.Fatal("not found")
 		}
@@ -121,7 +121,7 @@ func TestDnsEventStream(t *testing.T) {
 				Name: fmt.Sprintf("www%d.adviser.com", i),
 			},
 		}
-		pre := des.activeSubjects[keySubject(sub.question)]
+		pre := des.activeSubjects[KeySubject(sub.question)]
 		err = des.RemoveSubject(sub.question)
 		if err != nil {
 			t.Fatal(err)
@@ -168,92 +168,168 @@ func (rr *testRR) copy() dns.RR {
 }
 
 func TestToActions(t *testing.T) {
-	ai := toActions([]dns.RR{}, []dns.RR{})
+	ai := ToActions([]dns.RR{}, []dns.RR{})
 	if len(ai) != 0 {
 		t.Fatal("ai should be empty")
 	}
 	dup := &testRR{_string: "result", _header: dns.RR_Header{Name: "question"}}
 	// equal
-	ai = toActions([]dns.RR{dup, dup}, []dns.RR{dup, dup})
+	ai = ToActions([]dns.RR{dup, dup}, []dns.RR{dup, dup})
 	if len(ai) != 0 {
 		t.Fatal("ai should be empty")
 	}
 	// new
-	ai = toActions([]dns.RR{dup, dup}, []dns.RR{})
+	ai = ToActions([]dns.RR{dup, dup}, []dns.RR{})
 	if len(ai) != 1 {
 		t.Fatalf("ai should be 1: %v", len(ai))
 	}
-	if ai[0].action != "newAdd" {
-		t.Fatalf("ai should be newAdd: %v", ai[0].action)
+	if ai[0].Action != "newAdd" {
+		t.Fatalf("ai should be newAdd: %v", ai[0].Action)
 	}
-	if ai[0].idx != 0 {
-		t.Fatalf("ai should be 0: %v", ai[0].idx)
+	if ai[0].Idx != 0 {
+		t.Fatalf("ai should be 0: %v", ai[0].Idx)
+	}
+	if ai[0].Current != dup {
+		t.Error("ai[0].Current != dup")
+	}
+	if ai[0].Prev != nil {
+		t.Error("ai[0].Prev != nil")
 	}
 
 	// del
-	ai = toActions([]dns.RR{}, []dns.RR{dup, dup})
+	ai = ToActions([]dns.RR{}, []dns.RR{dup, dup})
 	if len(ai) != 1 {
 		t.Fatalf("ai should be 1: %v", len(ai))
 	}
-	if ai[0].action != "oldDel" {
-		t.Fatalf("ai should be oldDel: %v", ai[0].action)
+	if ai[0].Action != "oldDel" {
+		t.Fatalf("ai should be oldDel: %v", ai[0].Action)
 	}
-	if ai[0].idx != 0 {
-		t.Fatalf("ai should be 0: %v", ai[0].idx)
+	if ai[0].Idx != 0 {
+		t.Fatalf("ai should be 0: %v", ai[0].Idx)
+	}
+
+	if ai[0].Prev != dup {
+		t.Error("ai[0].Prev != dup")
+	}
+	if ai[0].Current != nil {
+		t.Error("ai[0].Current != nil")
 	}
 
 	dup1 := &testRR{_string: "result1", _header: dns.RR_Header{Name: "question1"}}
-	ai = toActions([]dns.RR{dup, dup1}, []dns.RR{dup})
+	ai = ToActions([]dns.RR{dup, dup1}, []dns.RR{dup})
 	if len(ai) != 1 {
 		t.Fatalf("ai should be 1: %v", len(ai))
 	}
-	if ai[0].action != "newAdd" {
-		t.Fatalf("ai should be oldDel: %v", ai[0].action)
+	if ai[0].Action != "newAdd" {
+		t.Fatalf("ai should be newAction: %v", ai[0].Action)
 	}
-	if ai[0].idx != 1 {
-		t.Fatalf("ai should be 0: %v", ai[1].idx)
+	if ai[0].Idx != 1 {
+		t.Fatalf("ai should be 0: %v", ai[1].Idx)
+	}
+	if ai[0].Current != dup1 {
+		t.Error("ai[0].Current != dup")
+	}
+	if ai[0].Prev != nil {
+		t.Error("ai[0].Prev != nil")
 	}
 
 	dup2 := &testRR{_string: "result2", _header: dns.RR_Header{Name: "question2"}}
-	ai = toActions([]dns.RR{dup, dup2}, []dns.RR{dup, dup1})
+	ai = ToActions([]dns.RR{dup, dup2}, []dns.RR{dup, dup1})
 	if len(ai) != 1 {
 		t.Fatalf("ai should be 1: %v", len(ai))
 	}
-	if ai[0].action != "change" {
-		t.Fatalf("ai should be change: %v", ai[0].action)
+	if ai[0].Action != "change" {
+		t.Fatalf("ai should be change: %v", ai[0].Action)
 	}
-	if ai[0].idx != 1 {
-		t.Fatalf("ai should be 0: %v", ai[1].idx)
+	if ai[0].Idx != 1 {
+		t.Fatalf("ai should be 0: %v", ai[1].Idx)
+	}
+	if ai[0].Current != dup2 {
+		t.Error("ai[0].Current != dup")
+	}
+	if ai[0].Prev != dup1 {
+		t.Error("ai[0].Prev != nil")
 	}
 
-	ai = toActions([]dns.RR{dup, dup2, dup1}, []dns.RR{dup, dup1})
+	ai = ToActions([]dns.RR{dup, dup2, dup1}, []dns.RR{dup, dup1})
 	if len(ai) != 1 {
 		t.Fatalf("ai should be 1: %v", len(ai))
 	}
-	if ai[0].action != "newAdd" {
-		t.Fatalf("ai should be change: %v", ai[0].action)
+	if ai[0].Action != "newAdd" {
+		t.Fatalf("ai should be change: %v", ai[0].Action)
 	}
-	if ai[0].idx != 2 {
-		t.Fatalf("ai should be 0: %v", ai[1].idx)
+	if ai[0].Idx != 2 {
+		t.Fatalf("ai should be 0: %v", ai[1].Idx)
+	}
+	if ai[0].Current != dup2 {
+		t.Error("ai[0].Current != dup")
+	}
+	if ai[0].Prev != nil {
+		t.Error("ai[0].Prev != nil")
 	}
 
-	ai = toActions([]dns.RR{dup, dup2, dup1}, []dns.RR{dup})
+	ai = ToActions([]dns.RR{dup, dup2, dup1}, []dns.RR{dup})
 	if len(ai) != 2 {
 		t.Fatalf("ai should be 1: %v", len(ai))
 	}
-	if ai[0].action != "newAdd" {
-		t.Fatalf("ai should be change: %v", ai[0].action)
+	if ai[0].Action != "newAdd" {
+		t.Fatalf("ai should be change: %v", ai[0].Action)
 	}
-	if ai[0].idx != 1 {
-		t.Fatalf("ai should be 0: %v", ai[0].idx)
+	if ai[0].Idx != 1 {
+		t.Fatalf("ai should be 0: %v", ai[0].Idx)
+	}
+	if ai[0].Current != dup1 {
+		t.Error("ai[0].Current != dup")
+	}
+	if ai[0].Prev != nil {
+		t.Error("ai[0].Prev != nil")
 	}
 
-	if ai[1].action != "newAdd" {
-		t.Fatalf("ai should be change: %v", ai[1].action)
+	if ai[1].Action != "newAdd" {
+		t.Fatalf("ai should be change: %v", ai[1].Action)
 	}
-	if ai[1].idx != 2 {
-		t.Fatalf("ai should be 0: %v", ai[1].idx)
+	if ai[1].Idx != 2 {
+		t.Fatalf("ai should be 0: %v", ai[1].Idx)
 	}
+	if ai[1].Current != dup2 {
+		t.Error("ai[0].Current != dup")
+	}
+	if ai[1].Prev != nil {
+		t.Error("ai[0].Prev != nil")
+	}
+
+	newRR := []dns.RR{&dns.A{
+		Hdr: dns.RR_Header{Name: "question1", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 0},
+		A:   net.ParseIP("76.76.21.9"),
+	},
+		&dns.A{
+			Hdr: dns.RR_Header{Name: "question1", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 0},
+			A:   net.ParseIP("76.76.21.98"),
+		},
+	}
+	oldRR := []dns.RR{&dns.A{
+		Hdr: dns.RR_Header{Name: "question1", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 0},
+		A:   net.ParseIP("76.76.21.22"),
+	},
+		&dns.A{
+			Hdr: dns.RR_Header{Name: "question1", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 0},
+			A:   net.ParseIP("76.76.21.9"),
+		},
+	}
+	ai = ToActions(newRR, oldRR)
+	if len(ai) != 1 {
+		t.Errorf("ai should be 1:%v", ai)
+	}
+	if ai[0].Action != "change" {
+		t.Error("ai[0].Action != change")
+	}
+	if ai[0].Current.String() != "question1	0	IN	A	76.76.21.98" {
+		t.Errorf("ai[0].Current.String() != %v", ai[0].Current.String())
+	}
+	if ai[0].Prev.String() != "question1	0	IN	A	76.76.21.22" {
+		t.Errorf("ai[0].Prev.String() != %v", ai[0].Prev.String())
+	}
+
 }
 
 type testSubject struct {
@@ -271,10 +347,10 @@ type testSubject struct {
 
 func (ts *testSubject) ensureLog() *zerolog.Logger {
 	if ts.activeSubject != nil {
-		zlog := ts.activeSubject.ensureLog().With().Str("key", keySubject(ts.question)).Timestamp().Logger()
+		zlog := ts.activeSubject.ensureLog().With().Str("key", KeySubject(ts.question)).Timestamp().Logger()
 		ts.log = &zlog
 	} else if ts.log == nil {
-		zlog := zerolog.New(os.Stderr).With().Str("key", keySubject(ts.question)).Timestamp().Logger()
+		zlog := zerolog.New(os.Stderr).With().Str("key", KeySubject(ts.question)).Timestamp().Logger()
 		ts.log = &zlog
 	}
 	return ts.log
