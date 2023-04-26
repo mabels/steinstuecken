@@ -132,7 +132,7 @@ func (as *ActiveSubject) Refresh() {
 	}
 	refreshTime := time.Second
 	if dnsrr.Err == nil && len(dnsrr.Rrs) > 0 {
-		nextTtl := math.MaxUint32
+		nextTtl := math.MaxInt32
 		for _, rr := range dnsrr.Rrs {
 			if nextTtl > int(rr.Header().Ttl) {
 				nextTtl = int(rr.Header().Ttl)
