@@ -99,15 +99,23 @@ func initIPTable(zlog *zerolog.Logger, config *cli.Config, protocol iptables.Pro
 }
 
 func InitIPTables(zlog *zerolog.Logger, config *cli.Config) (*IpTables, error) {
-	ipv4Log := zlog.With().Str("ipversion", "v4").Logger()
-	ipv4, err := initIPTable(&ipv4Log, config, iptables.ProtocolIpv4)
-	if err != nil {
-		return nil, err
+	var ipv4 *IpTable
+	if !config.DisableIPv4 {
+		ipv4Log := zlog.With().Str("ipversion", "v4").Logger()
+		var err error
+		ipv4, err = initIPTable(&ipv4Log, config, iptables.ProtocolIpv4)
+		if err != nil {
+			return nil, err
+		}
 	}
-	ipv6Log := zlog.With().Str("ipversion", "v6").Logger()
-	ipv6, err := initIPTable(&ipv6Log, config, iptables.ProtocolIpv6)
-	if err != nil {
-		return nil, err
+	var ipv6 *IpTable
+	if !config.DisableIPv6 {
+		ipv6Log := zlog.With().Str("ipversion", "v6").Logger()
+		var err error
+		ipv6, err = initIPTable(&ipv6Log, config, iptables.ProtocolIpv6)
+		if err != nil {
+			return nil, err
+		}
 	}
 	return &IpTables{
 		IpV4: ipv4,

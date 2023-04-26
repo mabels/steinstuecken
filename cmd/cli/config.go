@@ -39,11 +39,17 @@ type Config struct {
 	// ForwardMode bool
 	// MasqMode    bool
 	// SNatMode    bool
-	ChainName   string
-	NoFinalDrop bool
-	FirstRule   bool
-	targetsStr  []string // sken://target[:port]/?type=A&nameserver=IP&snat=IP&masq[=oif]&forward
-	Targets     []Target
+	ChainName      string
+	NoFinalDrop    bool
+	FirstRule      bool
+	AlternatePath  string
+	AlternateForce bool // default false override AlternatePath
+	SrcPath        string
+	IpTablesType   string   // empty means system -- nft or legacy default nft
+	DisableIPv4    bool     // default false
+	DisableIPv6    bool     // default false
+	targetsStr     []string // sken://target[:port]/?type=A&nameserver=IP&snat=IP&masq[=oif]&forward
+	Targets        []Target
 }
 
 type Cidr struct {
@@ -146,6 +152,12 @@ func GetConfig(log *zerolog.Logger) (Config, []error) {
 	pflag.StringVar(&conf.ChainName, "chain-name", "STEINSTUECKEN", "iptables chain name")
 	pflag.BoolVar(&conf.NoFinalDrop, "no-final-drop", false, "do not drop packets that do not match any rule")
 	pflag.BoolVar(&conf.FirstRule, "first-rule", false, "insert rule as first rule in chain")
+	pflag.StringVar(&conf.AlternatePath, "alternate-path", "/alternate", "if iptable-path to alternate iptables")
+	pflag.BoolVar(&conf.AlternateForce, "alternate-force", false, "override alternate-path")
+	pflag.StringVar(&conf.SrcPath, "src-path", "/sbin", "if iptable-path to src iptables")
+	pflag.StringVar(&conf.IpTablesType, "iptable-type", "", "empty means use system -- iptables type (nft or legacy)")
+	pflag.BoolVar(&conf.DisableIPv4, "disable-ipv4", false, "do not generate ipv4 rules")
+	pflag.BoolVar(&conf.DisableIPv6, "disable-ipv6", false, "do not generate ipv6 rules")
 	pflag.StringArrayVar(&conf.targetsStr, "target", []string{}, "target to connect to")
 	pflag.Parse()
 	errs := []error{}

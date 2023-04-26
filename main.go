@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"sync"
 
 	"github.com/mabels/steinstuecken/cmd/cli"
@@ -114,6 +115,12 @@ func selectIpTable(zlog *zerolog.Logger, ipts *iptables_actions.IpTables, target
 		zlog.Error().Err(err).Uint16("qtype", subject.Key().Qtype).Msg("unknown qtype")
 		return nil, err
 	}
+	if iptable == nil {
+		zlog.Debug().Msg("skipping iptable")
+		return func(add_remove string, alog *zerolog.Logger, ip string, target *cli.Target) []error {
+			return []error{}
+		}, nil
+	}
 	// var jump *iptables_actions.StringArrayBuilder
 	actionFunc := func(add_remove string, alog *zerolog.Logger, ip string, target *cli.Target) []error {
 		jump := iptables_actions.NewStringArrayBuilder().
@@ -219,11 +226,74 @@ func bindFn(zlog *zerolog.Logger, target *cli.Target, subject dnsEvents.Subject,
 	}
 }
 
+type dstSrc struct {
+	src string
+	dst string
+}
+
+var templateIptableExecutables = []dstSrc{
+	{src: "ip6tables-%s", dst: "ip6tables"},
+	{src: "ip6tables-%s-restore", dst: "ip6tables-restore"},
+	{src: "ip6tables-%s-save", dst: "ip6tables-save"},
+	{src: "iptables-%s", dst: "iptables"},
+	{src: "iptables-%s-restore", dst: "iptables-restore"},
+	{src: "iptables-%s-save", dst: "iptables-save"},
+}
+
+func selectIpTablesExecutable(zlog *zerolog.Logger, config *cli.Config) error {
+	if config.IpTablesType != "" {
+		err := os.MkdirAll(config.AlternatePath, 0755)
+		if err != nil {
+			return err
+		}
+		err = os.Setenv("PATH", config.AlternatePath+":"+os.Getenv("PATH"))
+		if err != nil {
+			return err
+		}
+		switch config.IpTablesType {
+		case "nft":
+		case "legacy":
+		default:
+			return fmt.Errorf("unknown iptables type %s", config.IpTablesType)
+		}
+		for _, template := range templateIptableExecutables {
+			srcFile := fmt.Sprintf(filepath.Join(config.SrcPath, template.src), config.IpTablesType)
+			st, err := os.Stat(srcFile)
+			if err != nil && !st.IsDir() && st.Mode().Perm()&0111 != 0 {
+				return fmt.Errorf("src error stating %s: %w", srcFile, err)
+			}
+			dstFile := filepath.Join(config.AlternatePath, template.dst)
+			_, err = os.Stat(dstFile)
+			if config.AlternateForce {
+				if err == nil {
+					err = os.Remove(dstFile)
+					if err != nil {
+						return fmt.Errorf("error removing %s: %w", dstFile, err)
+					}
+				}
+			} else if err == nil {
+				return fmt.Errorf("dest should not exist %s", dstFile)
+			}
+			err = os.Symlink(srcFile, dstFile)
+			if err != nil {
+				return fmt.Errorf("error symlinking %s to %s: %w", srcFile, dstFile, err)
+			}
+		}
+		zlog.Debug().Str("iptables_type", config.IpTablesType).Str("alternatepath", config.AlternatePath).Msg("setup alternate path")
+	}
+	return nil
+}
+
 func main() {
 	zlog := zerolog.New(os.Stderr).With().Timestamp().Logger()
 	config, errs := cli.GetConfig(&zlog)
 	if len(errs) > 0 {
 		zlog.Fatal().Errs("errors", errs).Msg("errors in config")
+	}
+
+	err := selectIpTablesExecutable(&zlog, &config)
+	if err != nil {
+		zlog.Fatal().Err(err).Msg("error selecting iptables")
 	}
 
 	ipts, err := iptables_actions.InitIPTables(&zlog, &config)
