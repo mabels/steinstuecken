@@ -1,14 +1,14 @@
 package iptables_actions
 
-type stringArrayBuilder struct {
-	out []string
+type StringArrayBuilder struct {
+	Out []string
 }
 
-func newStringArrayBuilder() *stringArrayBuilder {
-	return &stringArrayBuilder{}
+func NewStringArrayBuilder() *StringArrayBuilder {
+	return &StringArrayBuilder{}
 }
 
-func (sab *stringArrayBuilder) add(strs ...string) *stringArrayBuilder {
-	sab.out = append(sab.out, strs...)
+func (sab *StringArrayBuilder) Add(strs ...string) *StringArrayBuilder {
+	sab.Out = append(sab.Out, strs...)
 	return sab
 }

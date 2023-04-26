@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"strings"
 	"sync"
 
 	"github.com/mabels/steinstuecken/cmd/cli"
@@ -15,25 +14,205 @@ import (
 	"github.com/mabels/steinstuecken/iptables_actions"
 	"github.com/miekg/dns"
 	"github.com/rs/zerolog"
-	"k8s.io/kubernetes/pkg/util/iptables"
-	"k8s.io/utils/exec"
 	// "sigs.k8s.io/external-dns/provider/google"
 	// "sigs.k8s.io/external-dns/provider"
 	// "sigs.k8s.io/external-dns/endpoint"
 	// sigs.k8s.io/external-dns/provider/aws"
 )
 
-func getIPAddress(rr dns.RR) (string, error) {
-	a, found := rr.(*dns.A)
-	if !found {
-		txt, found := rr.(*dns.TXT)
-		if !found {
-			return "", fmt.Errorf("error casting to dns.A/TXT")
+func cidrInTxt(txts []string) *string {
+	var ip *string = nil
+	for _, txt := range txts {
+		nip, _, err := net.ParseCIDR(txt)
+		if err != nil {
+			continue
 		}
-		return txt.Txt[0], nil
+		if nip != nil {
+			ip = &txt
+			break
+		}
 	}
-	ipA := net.IPv4(a.A[0], a.A[1], a.A[2], a.A[3]).String()
-	return ipA, nil
+	return ip
+}
+
+func getIPAddress(rr dns.RR) (string, bool, error) {
+	a, found := rr.(*dns.A)
+	if found {
+		ipA := a.A.String()
+		return ipA, false, nil
+	}
+	aaaa, found := rr.(*dns.AAAA)
+	if found {
+		ipA := aaaa.AAAA.String()
+		return ipA, false, nil
+	}
+	txt, found := rr.(*dns.TXT)
+	if found {
+		ip := cidrInTxt(txt.Txt)
+		if ip != nil {
+			return "", false, fmt.Errorf("found cidr in TXT record: %v", txt.Txt)
+		}
+		return *ip, false, nil
+	}
+	_, skip := rr.(*dns.CNAME)
+	return "", skip, fmt.Errorf("error casting to dns.A/TXT")
+}
+
+type actionFn func(action string, zlog *zerolog.Logger, ipA string, target *cli.Target) []error
+
+func selectIpTable(zlog *zerolog.Logger, ipts *iptables_actions.IpTables, target *cli.Target, subject dnsEvents.Subject, history []*dnsEvents.DnsResult) (actionFn, error) {
+	var iptable *iptables_actions.IpTable
+	switch subject.Key().Qtype {
+	case dns.TypeA:
+		iptable = ipts.IpV4
+	case dns.TypeAAAA:
+		iptable = ipts.IpV6
+	case dns.TypeTXT:
+		dnsResult := dnsEvents.NewestValidHistory(history)
+		if len(dnsResult.Rrs) == 0 {
+			err := fmt.Errorf("no TXT records found")
+			zlog.Error().Err(err).Msg("LastValidHistor")
+			return nil, err
+		}
+		for _, _rr := range dnsResult.Rrs {
+			rr, found := _rr.(*dns.TXT)
+			if !found {
+				zlog.Warn().Str("_rr", _rr.String()).Msg("no dns.TXT")
+				continue
+			}
+			ipStr := cidrInTxt(rr.Txt)
+			if ipStr != nil {
+				ip := net.ParseIP(*ipStr)
+				if ip == nil {
+					zlog.Error().Str("ipStr", *ipStr).Msg("no ip")
+					continue
+				}
+				if ip.To4() != nil {
+					iptable = ipts.IpV4
+				} else {
+					iptable = ipts.IpV6
+				}
+				break
+			} else {
+				zlog.Warn().Strs("txt", rr.Txt).Msg("no ip")
+			}
+			if iptable != nil {
+				break
+			}
+		}
+		if iptable == nil {
+			err := fmt.Errorf("no TXT records with valid IP found")
+			zlog.Error().Err(err).Msg("no iptable found")
+			return nil, err
+		}
+	default:
+		err := fmt.Errorf("unknown qtype %d", subject.Key().Qtype)
+		zlog.Error().Err(err).Uint16("qtype", subject.Key().Qtype).Msg("unknown qtype")
+		return nil, err
+	}
+	// var jump *iptables_actions.StringArrayBuilder
+	actionFunc := func(add_remove string, alog *zerolog.Logger, ip string, target *cli.Target) []error {
+		jump := iptables_actions.NewStringArrayBuilder().
+			Add("-j", "ACCEPT").
+			Add("-m", "comment", "--comment", dnsEvents.KeySubject(subject.Key()))
+		return iptables_actions.Forward(add_remove, alog, iptable.FWD.Chain, iptable.FWD.Table, ip, target, iptable.IpTable, jump.Out)
+	}
+	forwardActionFunc := actionFunc
+	if target.Snat4 != nil || target.Snat6 != nil {
+		actionFunc = func(add_remove string, alog *zerolog.Logger, ip string, target *cli.Target) []error {
+			ret := forwardActionFunc(add_remove, alog, ip, target)
+			var snat *string
+			if iptable.IpTable.IsIpv6() {
+				snat = target.Snat6
+			} else {
+				snat = target.Snat4
+			}
+			if snat != nil {
+				jump := iptables_actions.NewStringArrayBuilder().
+					Add("-j", "SNAT", "--to-source", *snat).
+					Add("-m", "comment", "--comment", dnsEvents.KeySubject(subject.Key()))
+				ret = append(ret, iptables_actions.Forward(add_remove, alog, iptable.NAT.Chain, iptable.NAT.Table, ip, target, iptable.IpTable, jump.Out)...)
+			}
+			return ret
+		}
+	} else if target.Masq != nil {
+		actionFunc = func(add_remove string, alog *zerolog.Logger, ip string, target *cli.Target) []error {
+			ret := forwardActionFunc(add_remove, alog, ip, target)
+			jump := iptables_actions.NewStringArrayBuilder().
+				Add("-j", "MASQUERADE").
+				Add("-m", "comment", "--comment", dnsEvents.KeySubject(subject.Key()))
+			ret = append(ret, iptables_actions.Forward(add_remove, alog, iptable.NAT.Chain, iptable.NAT.Table, ip, target, iptable.IpTable, jump.Out)...)
+			return ret
+		}
+	}
+	return actionFunc, nil
+}
+
+func bindFn(zlog *zerolog.Logger, target *cli.Target, subject dnsEvents.Subject, ipts *iptables_actions.IpTables) func(history []*dnsEvents.DnsResult) {
+	return func(history []*dnsEvents.DnsResult) {
+		if history[0].Err != nil {
+			zlog.Error().Err(history[0].Err).Msg("error resolving")
+		} else {
+			actionFunc, err := selectIpTable(zlog, ipts, target, subject, history)
+			if err != nil {
+				return
+			}
+			actions := dnsEvents.CurrentToActions(history)
+			for _, action := range actions {
+				errs := []error{}
+				alog := zlog.With().Int("histories", len(history)).Str("action", action.Action).Str("subject", dnsEvents.KeySubject(subject.Key())).Logger()
+				switch action.Action {
+				case "newAdd":
+					ipA, skip, err := getIPAddress(action.Current)
+					if skip {
+						continue
+					}
+					if err != nil {
+						zlog.Error().Err(err).Msg("newAdd error")
+						continue
+					}
+					errs = actionFunc("add", &alog, ipA, target)
+				case "change":
+					cipA, skip, err := getIPAddress(action.Current)
+					if skip {
+						continue
+					}
+					if err != nil {
+						zlog.Error().Err(err).Msg("current change error")
+						continue
+					}
+					pipA, skip, err := getIPAddress(action.Prev)
+					if skip {
+						continue
+					}
+					if err != nil {
+						zlog.Error().Err(err).Msg("prev change error")
+						continue
+					}
+					if cipA == pipA {
+						continue
+					}
+					errs = append(errs, actionFunc("remove", &alog, pipA, target)...)
+					errs = append(errs, actionFunc("add", &alog, cipA, target)...)
+				case "oldDel":
+					ipA, skip, err := getIPAddress(action.Prev)
+					if skip {
+						continue
+					}
+					if err != nil {
+						zlog.Error().Err(err).Msg("prev oldDel error")
+						continue
+					}
+					errs = actionFunc("remove", &alog, ipA, target)
+				default:
+					zlog.Fatal().Msg("unknown action")
+				}
+				if len(errs) > 0 {
+					zlog.Log().Errs("errors", errs).Msg("errors in iptables")
+				}
+			}
+		}
+	}
 }
 
 func main() {
@@ -43,56 +222,9 @@ func main() {
 		zlog.Fatal().Errs("errors", errs).Msg("errors in config")
 	}
 
-	execer := exec.New()
-	protocolv4 := iptables.ProtocolIpv4
-	protocolv6 := iptables.ProtocolIpv6
-	ipt4 := iptables.New(execer, nil, protocolv4)
-	ipt6 := iptables.New(execer, nil, protocolv6)
-
-	ipChain := iptables.Chain(config.ChainName)
-	for _, table := range []iptables.Interface{ipt4, ipt6} {
-		_, err := table.EnsureChain(iptables.TableFilter, iptables.ChainForward)
-		if err != nil {
-			zlog.Error().Err(err).Msg("error ensuring chain")
-			return
-		}
-		err = table.DeleteRule(iptables.TableFilter, iptables.ChainForward, "-j", config.ChainName)
-		if err != nil && !strings.Contains(err.Error(), fmt.Sprintf("Chain '%s' does not exist", config.ChainName)) {
-			zlog.Error().Err(err).Msg("error deleting rule")
-			return
-		}
-		err = table.FlushChain(iptables.TableFilter, ipChain)
-		if err != nil && !strings.Contains(err.Error(), fmt.Sprintf("error flushing chain \"%s\"", config.ChainName)) {
-			zlog.Error().Err(err).Msg("error flushing chain")
-			return
-		}
-		_, err = table.EnsureChain(iptables.TableFilter, ipChain)
-		if err != nil {
-			zlog.Error().Err(err).Msg("error ensuring chain")
-			return
-		}
-		rulePosition := iptables.Append
-		if config.FirstRule {
-			rulePosition = iptables.Prepend
-		}
-		_, err = table.EnsureRule(rulePosition, iptables.TableFilter, iptables.ChainForward, "-j", config.ChainName)
-		if err != nil {
-			zlog.Error().Err(err).Msg("error ensuring rule")
-			return
-		}
-		if !config.NoFinalDrop {
-			_, err = table.EnsureRule(iptables.Append, iptables.TableFilter, ipChain, "-j", "DROP")
-			if err != nil {
-				zlog.Error().Err(err).Msg("error ensuring rule")
-				return
-			}
-		} else {
-			_, err = table.EnsureRule(iptables.Append, iptables.TableFilter, ipChain, "-j", "RETURN")
-			if err != nil {
-				zlog.Error().Err(err).Msg("error ensuring rule")
-				return
-			}
-		}
+	ipts, err := iptables_actions.InitIPTables(&zlog, &config)
+	if err != nil {
+		zlog.Fatal().Err(err).Msg("error initializing iptables")
 	}
 
 	des := dnsEvents.NewDnsEventStream(&zlog)
@@ -100,92 +232,23 @@ func main() {
 	des.Start()
 	for _, _target := range config.Targets {
 		target := _target
-		as, err := des.CreateSubject(target.Subject)
-		if err != nil {
-			zlog.Fatal().Err(err).Msg("error creating subject")
-			continue
-		}
-		as.Bind(func(history []*dnsEvents.DnsResult) {
-			if history[0].Err != nil {
-				zlog.Error().Err(history[0].Err).Msg("error resolving")
-			} else {
-				actions := dnsEvents.CurrentToActions(history)
-				for _, action := range actions {
-					var errs []error
-					alog := zlog.With().Int("histories", len(history)).Str("action", action.Action).Str("subject", dnsEvents.KeySubject(target.Subject.Key())).Logger()
-					switch action.Action {
-					case "newAdd":
-						ipA, err := getIPAddress(action.Current)
-						if err != nil {
-							zlog.Error().Err(err).Msg("newAdd error")
-							break
-						}
-						errs = iptables_actions.Forward("add", &alog, ipChain, ipA, &target, ipt4)
-					case "change":
-						cipA, err := getIPAddress(action.Current)
-						if err != nil {
-							zlog.Error().Err(err).Msg("current change error")
-							break
-						}
-						pipA, err := getIPAddress(action.Prev)
-						if err != nil {
-							zlog.Error().Err(err).Msg("prev change error")
-							break
-						}
-						if cipA == pipA {
-							continue
-						}
-						errs = append(errs, iptables_actions.Forward("remove", &alog, ipChain, pipA, &target, ipt4)...)
-						errs = append(errs, iptables_actions.Forward("add", &alog, ipChain, cipA, &target, ipt4)...)
-					case "oldDel":
-						ipA, err := getIPAddress(action.Prev)
-						if err != nil {
-							zlog.Error().Err(err).Msg("prev oldDel error")
-							break
-						}
-						errs = iptables_actions.Forward("remove", &alog, ipChain, ipA, &target, ipt4)
-					default:
-						zlog.Fatal().Msg("unknown action")
-					}
-					if len(errs) > 0 {
-						zlog.Log().Errs("errors", errs).Msg("errors in iptables")
-					}
-				}
-			}
-		})
-		err = as.Activate()
-		if err != nil {
-			zlog.Fatal().Err(err).Msg("error activating subject")
-		}
-		zlog.Info().Str("target", dnsEvents.KeySubject(as.Subject.Key())).Msg("activated")
-	}
+		for _, subject := range target.Subjects {
 
+			as, err := des.CreateSubject(subject)
+			if err != nil {
+				zlog.Error().Err(err).Msg("error creating subject")
+				continue
+			}
+			as.Bind(bindFn(as.Log, &target, subject, ipts))
+			err = as.Activate()
+			if err != nil {
+				zlog.Error().Err(err).Msg("error activating subject")
+				continue
+			}
+			as.Log.Info().Str("target", dnsEvents.KeySubject(as.Subject.Key())).Msg("activated")
+		}
+	}
 	wg := sync.WaitGroup{}
 	wg.Add(1)
 	wg.Wait()
-
-	// dns, err := google.NewGoogleProvider(context.Background(),
-	// 	"vibrant-mantis-723",
-	// 	endpoint.DomainFilter{Filters:[]string{"adviser.com"}},
-	// 	provider.ZoneIDFilter{ZoneIDs:[]string{}},
-	// 	0, 0, "", false)
-	// if err != nil {
-	// 	panic(err)
-	// }
-
-	// eps, err := dns.Records(context.Background())
-	// if err != nil {
-	// 	panic(err)
-	// }
-	// for _, ep := range eps {
-	// 	fmt.Println(ep)
-	// }
-	// err = dns.CreateRecords([]*endpoint.Endpoint{
-	// 	endpoint.NewEndpoint("steinstuecken.adviser.com.", "AAAA", "fc00::1", "fc00::2"),
-	// })
-	// if err != nil {
-	// 	panic(err)
-	// }
-
-	// dns, err := dns_observer.NewDNSObserver(dns_observer.Direct, "www.adviser.com", []string{"AAAA", "A"})
 }

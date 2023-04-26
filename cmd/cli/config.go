@@ -21,17 +21,18 @@ type Port struct {
 }
 
 type Target struct {
-	Subject     des.Subject
+	Subjects    []des.Subject
 	Ports       []Port
 	NonStateful bool
 	Interface   struct {
 		Input  *string
 		Output *string
 	}
-	Protos   []string
-	Snat4    *string
-	Masq4    *string
-	Forward4 *string
+	Protos  []string
+	Snat4   *string
+	Snat6   *string
+	Masq    *string
+	Forward *string
 }
 
 type Config struct {
@@ -41,7 +42,7 @@ type Config struct {
 	ChainName   string
 	NoFinalDrop bool
 	FirstRule   bool
-	targetsStr  []string // sken://target[:port]/?type=A&nameserver=IP&snat4=IP&masq4[=oif]&forward4
+	targetsStr  []string // sken://target[:port]/?type=A&nameserver=IP&snat=IP&masq[=oif]&forward
 	Targets     []Target
 }
 
@@ -65,6 +66,80 @@ func (c *Cidr) Header() *dns.RR_Header {
 // }
 
 var rePorts = regexp.MustCompile("[|,]+")
+var rePrefixUrl = regexp.MustCompile(`/\d+$`)
+
+func getSubjects(targetUrl *url.URL, log *zerolog.Logger) ([]des.Subject, error) {
+	var subjects []des.Subject
+	if net.ParseIP(targetUrl.Hostname()) != nil {
+		ip := net.ParseIP(targetUrl.Hostname())
+		rrType := dns.TypeA
+		if ip.To4() == nil {
+			rrType = dns.TypeAAAA
+		}
+		rrHeader := dns.RR_Header{
+			Name:     targetUrl.Hostname(),
+			Rrtype:   rrType,
+			Ttl:      math.MaxInt32,
+			Class:    dns.ClassINET,
+			Rdlength: uint16(len(ip)),
+		}
+		txt := ip.String()
+		prefixStr := targetUrl.Path
+		if rePrefixUrl.MatchString(prefixStr) {
+			prefix, err := strconv.Atoi(strings.TrimLeft(prefixStr, "/"))
+			if !(err == nil && ((ip.To4() == nil && prefix >= 0 && prefix <= 128) ||
+				(ip.To4() != nil && prefix >= 0 && prefix <= 32))) {
+				prefix = 32
+				if ip.To4() == nil {
+					prefix = 128
+				}
+			}
+			txt = fmt.Sprintf("%s/%d", txt, prefix)
+		}
+		rr := &dns.TXT{
+			Hdr: rrHeader,
+			Txt: []string{txt},
+		}
+		subjects = append(subjects, &des.FixResolverSubject{
+			Question: dns.Question{
+				Name:   targetUrl.Hostname(),
+				Qtype:  dns.TypeTXT,
+				Qclass: dns.ClassINET,
+			},
+			Result: []dns.RR{rr},
+		})
+	} else {
+		hostname := targetUrl.Hostname()
+		if !strings.HasSuffix(hostname, ".") {
+			hostname += "." // dns package requires trailing dot
+		}
+		strTypes, found := targetUrl.Query()["type"]
+		if !found {
+			strTypes = []string{"A"}
+		}
+		types := []uint16{}
+		for _, strType := range strTypes {
+			typ, found := dns.StringToType[strType]
+			if !found {
+				continue
+			}
+			types = append(types, typ)
+		}
+		for _, typ := range types {
+			sysresolver := des.SysResolverSubject{
+				Log:         log,
+				NameServers: targetUrl.Query()["nameserver"],
+				Question: dns.Question{
+					Name:   hostname,
+					Qclass: dns.ClassINET,
+					Qtype:  typ,
+				},
+			}
+			subjects = append(subjects, &sysresolver)
+		}
+	}
+	return subjects, nil
+}
 
 func GetConfig(log *zerolog.Logger) (Config, []error) {
 	conf := Config{}
@@ -84,60 +159,10 @@ func GetConfig(log *zerolog.Logger) (Config, []error) {
 			errs = append(errs, fmt.Errorf("target %s has invalid scheme: %w", targetStr, err))
 			continue
 		}
-		var subject des.Subject
-		if net.ParseIP(targetUrl.Hostname()) != nil {
-			ip := net.ParseIP(targetUrl.Hostname())
-			rrType := dns.TypeA
-			if ip.To4() == nil {
-				rrType = dns.TypeAAAA
-			}
-			rrHeader := dns.RR_Header{
-				Name:     targetUrl.Hostname(),
-				Rrtype:   rrType,
-				Ttl:      math.MaxInt32,
-				Class:    dns.ClassINET,
-				Rdlength: uint16(len(ip)),
-			}
-			prefixStr := targetUrl.Path
-			prefix, err := strconv.Atoi(strings.TrimLeft(prefixStr, "/"))
-			if !(err == nil && ((ip.To4() == nil && prefix >= 0 && prefix <= 128) ||
-				(ip.To4() != nil && prefix >= 0 && prefix <= 32))) {
-				prefix = 32
-				if ip.To4() == nil {
-					prefix = 128
-				}
-			}
-			rr := &dns.TXT{
-				Hdr: rrHeader,
-				Txt: []string{fmt.Sprintf("%s/%d", ip.String(), prefix)},
-			}
-			subject = &des.FixResolverSubject{
-				Question: dns.Question{
-					Name:   targetUrl.Hostname(),
-					Qtype:  dns.TypeTXT,
-					Qclass: dns.ClassINET,
-				},
-				Result: []dns.RR{rr},
-			}
-		} else {
-			hostname := targetUrl.Hostname()
-			if !strings.HasSuffix(hostname, ".") {
-				hostname += "." // dns package requires trailing dot
-			}
-			sysresolver := des.SysResolverSubject{
-				Log:         log,
-				NameServers: targetUrl.Query()["nameserver"],
-				Question: dns.Question{
-					Name:   hostname,
-					Qclass: dns.ClassINET,
-				},
-			}
-			var found bool
-			sysresolver.Question.Qtype, found = dns.StringToType[targetUrl.Query().Get("type")]
-			if !found {
-				sysresolver.Question.Qtype = dns.TypeA
-			}
-			subject = &sysresolver
+		subjects, err := getSubjects(targetUrl, log)
+		if err != nil {
+			errs = append(errs, err)
+			continue
 		}
 		ports := []Port{}
 		portsStrs, found := targetUrl.Query()["port"]
@@ -180,33 +205,28 @@ func GetConfig(log *zerolog.Logger) (Config, []error) {
 
 		target := Target{
 			Ports:       ports,
-			Subject:     subject,
+			Subjects:    subjects,
 			Interface:   iface,
 			NonStateful: nonStateful,
 		}
 
+		target.Forward = &targetUrl.Host
+
 		snat4, snat4found := targetUrl.Query()["snat4"]
-		_, forward4found := targetUrl.Query()["forward4"]
-		masq4, masq4found := targetUrl.Query()["masq4"]
-		if !snat4found && !forward4found && !masq4found {
-			forward4found = true
-		}
-		if snat4found && !forward4found && !masq4found {
-			if len(snat4) == 0 || net.ParseIP(snat4[0]).To4() == nil {
-				errs = append(errs, fmt.Errorf("target %s snat4 needs an ip:%v", targetStr, snat4))
-				continue
+		snat6, snat6found := targetUrl.Query()["snat6"]
+		_, masqfound := targetUrl.Query()["masq"]
+
+		if (snat4found || snat6found) && !masqfound {
+			if len(snat4) > 0 {
+				target.Snat4 = &snat4[0]
 			}
-			target.Snat4 = &snat4[0]
-		} else if !snat4found && forward4found && !masq4found {
-			target.Forward4 = &targetUrl.Host
-		} else if !snat4found && !forward4found && masq4found {
-			if len(masq4) > 0 {
-				target.Masq4 = &masq4[0]
-			} else {
-				target.Masq4 = &targetUrl.Host
+			if len(snat6) > 0 {
+				target.Snat6 = &snat6[0]
 			}
-		} else {
-			errs = append(errs, fmt.Errorf("target %s only one mode is allowed snat4/forward4/masq4", targetStr))
+		} else if !(snat4found || snat6found) && masqfound {
+			target.Masq = &targetUrl.Host
+		} else if (snat4found || snat6found) && masqfound {
+			errs = append(errs, fmt.Errorf("target %s only one mode is allowed snat/masq", targetStr))
 			continue
 		}
 

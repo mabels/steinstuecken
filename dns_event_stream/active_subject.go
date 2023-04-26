@@ -118,16 +118,16 @@ func (as *ActiveSubject) Refresh() {
 	invokeBounds := false
 	ai := []ActionItem{}
 	if len(as.history) > 0 {
-		last := LastValidHistory(as.history)
+		last := NewestValidHistory(as.history)
 		ai = ToActions(dnsrr.Rrs, last.Rrs)
 	}
 	if len(as.history) == 0 {
 		as.history = unshiftMax(&dnsrr, as.history, as.dnsEventStream.HistoryLimit())
-		as.ensureLog().Debug().Any("history", as.history).Int("historyLen", len(as.history)).Msgf("init history: %v", ai)
+		as.ensureLog().Debug(). /*.Any("history", as.history)*/ Int("historyLen", len(as.history)).Msgf("init history: %v", ai)
 		invokeBounds = true
 	} else if len(ai) > 0 {
 		as.history = unshiftMax(&dnsrr, as.history, as.dnsEventStream.HistoryLimit())
-		as.ensureLog().Debug().Any("history", as.history).Int("historyLen", len(as.history)).Msgf("add history: %v", ai)
+		as.ensureLog().Debug(). /*.Any("history", as.history)*/ Int("historyLen", len(as.history)).Msgf("add history: %v", ai)
 		invokeBounds = true
 	}
 	refreshTime := time.Second

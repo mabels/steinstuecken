@@ -9,22 +9,22 @@ import (
 	"k8s.io/kubernetes/pkg/util/iptables"
 )
 
-func addOrRemove(add_or_remove string, zlog *zerolog.Logger, ipChain iptables.Chain, params *stringArrayBuilder, ipt iptables.Interface) error {
+func addOrRemove(add_or_remove string, zlog *zerolog.Logger, ipChain iptables.Chain, ipTable iptables.Table, params *StringArrayBuilder, ipt iptables.Interface) error {
 	var err error
 	switch add_or_remove {
 	case "add":
-		zlog.Debug().Str("chain", string(ipChain)).Str("params", strings.Join(params.out, " ")).Msg("adding rule")
-		_, err = ipt.EnsureRule(iptables.Prepend, iptables.TableFilter, ipChain, params.out...)
+		zlog.Debug().Str("chain", string(ipChain)).Str("params", strings.Join(params.Out, " ")).Msg("adding rule")
+		_, err = ipt.EnsureRule(iptables.Prepend, ipTable, ipChain, params.Out...)
 	case "remove":
-		zlog.Debug().Str("chain", string(ipChain)).Str("params", strings.Join(params.out, " ")).Msg("remove rule")
-		err = ipt.DeleteRule(iptables.TableFilter, ipChain, params.out...)
+		zlog.Debug().Str("chain", string(ipChain)).Str("params", strings.Join(params.Out, " ")).Msg("remove rule")
+		err = ipt.DeleteRule(ipTable, ipChain, params.Out...)
 	default:
 		err = fmt.Errorf("unknown add_or_remove: %s", add_or_remove)
 	}
 	return err
 }
 
-func Forward(add_or_remove string, zlog *zerolog.Logger, ipChain iptables.Chain, ip string, target *cli.Target, ipt iptables.Interface) (errs []error) {
+func Forward(add_or_remove string, zlog *zerolog.Logger, ipChain iptables.Chain, ipTable iptables.Table, ip string, target *cli.Target, ipt iptables.Interface, jump []string) (errs []error) {
 	inIfaceParam := []string{}
 	if target.Interface.Input != nil {
 		inIfaceParam = []string{"-i", *target.Interface.Input}
@@ -35,59 +35,61 @@ func Forward(add_or_remove string, zlog *zerolog.Logger, ipChain iptables.Chain,
 	}
 
 	for _, port := range target.Ports {
-		proto := newStringArrayBuilder()
+		proto := NewStringArrayBuilder()
 		if !(port.Proto == "" || port.Proto == "all") {
-			proto.add("-p", port.Proto)
+			proto.Add("-p", port.Proto)
 		}
-		dport := newStringArrayBuilder()
-		sport := newStringArrayBuilder()
+		dport := NewStringArrayBuilder()
+		sport := NewStringArrayBuilder()
 		if len(port.Port) != 0 {
 			if port.Proto != "icmp" {
 				if len(port.Port) == 1 {
-					dport.add("--dport", port.Port[0])
-					sport.add("--sport", port.Port[0])
+					dport.Add("--dport", port.Port[0])
+					sport.Add("--sport", port.Port[0])
 				} else {
 					portStr := strings.Join(port.Port, ",")
-					dport.add("-m", "multiport", "--dports", portStr)
-					sport.add("-m", "multiport", "--sports", portStr)
+					dport.Add("-m", "multiport", "--dports", portStr)
+					sport.Add("-m", "multiport", "--sports", portStr)
 				}
 			} else {
 				portStr := strings.Join(port.Port, ",")
-				dport.add("--icmp-type", portStr)
-				sport.add("--icmp-type", portStr)
+				dport.Add("--icmp-type", portStr)
+				sport.Add("--icmp-type", portStr)
 			}
 		}
-		outStateful := newStringArrayBuilder()
-		inStateful := newStringArrayBuilder()
+		outStateful := NewStringArrayBuilder()
+		inStateful := NewStringArrayBuilder()
 		if target.NonStateful {
-			outStateful.add("-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED,NEW")
-			inStateful.add("-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED")
+			outStateful.Add("-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED,NEW")
+			inStateful.Add("-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED")
 		}
-		params := newStringArrayBuilder().
-			add(outStateful.out...).
-			add("-d", ip).
-			add(proto.out...).
-			add(dport.out...).
-			add(outIfaceParam...).
-			add("-j", "ACCEPT")
-		err := addOrRemove(add_or_remove, zlog, ipChain, params, ipt)
+		params := NewStringArrayBuilder().
+			Add(outStateful.Out...).
+			Add("-d", ip).
+			Add(proto.Out...).
+			Add(dport.Out...).
+			Add(outIfaceParam...).
+			Add(jump...)
+		err := addOrRemove(add_or_remove, zlog, ipChain, ipTable, params, ipt)
 		if err != nil {
 			errs = append(errs, err)
-			zlog.Error().Err(err).Msg("error ensuring rule")
+			zlog.Error().Str("add_or_remove", add_or_remove).Str("chain", string(ipChain)).Err(err).Msg("out error ensuring rule")
 			continue
 		}
-		params = newStringArrayBuilder().
-			add(inStateful.out...).
-			add("-s", ip).
-			add(proto.out...).
-			add(sport.out...).
-			add(inIfaceParam...).
-			add("-j", "ACCEPT")
-		err = addOrRemove(add_or_remove, zlog, ipChain, params, ipt)
-		if err != nil {
-			errs = append(errs, err)
-			zlog.Error().Err(err).Msg("error ensuring rule")
-			continue
+		if ipTable != iptables.TableNAT {
+			params = NewStringArrayBuilder().
+				Add(inStateful.Out...).
+				Add("-s", ip).
+				Add(proto.Out...).
+				Add(sport.Out...).
+				Add(inIfaceParam...).
+				Add(jump...)
+			err = addOrRemove(add_or_remove, zlog, ipChain, ipTable, params, ipt)
+			if err != nil {
+				errs = append(errs, err)
+				zlog.Error().Str("add_or_remove", add_or_remove).Str("chain", string(ipChain)).Err(err).Msg("in error ensuring rule")
+				continue
+			}
 		}
 	}
 	return

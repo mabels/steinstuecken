@@ -30,7 +30,7 @@ require (
 	github.com/posener/h2conn v0.0.0-20180911140238-13e7df33ed15
 	github.com/rogpeppe/go-internal v1.8.1 // indirect
 	github.com/rs/zerolog v1.29.0
-	golang.org/x/net v0.9.0
+	golang.org/x/net v0.9.0 // indirect
 	golang.org/x/sys v0.7.0 // indirect
 	gopkg.in/check.v1 v1.0.0-20201130134442-10cb98267c6c // indirect
 )

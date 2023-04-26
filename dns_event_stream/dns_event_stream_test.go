@@ -433,16 +433,20 @@ func TestActiveResolve(t *testing.T) {
 }
 
 type mockTime struct {
+	sleepAfter int
+	sysTime    sysTime
+
 	nows         []time.Time
 	sleeps       []time.Duration
-	sleepAfter   int
 	releaseDelay chan int
 	sleepWait    sync.WaitGroup
-	sysTime      sysTime
 }
 
-func newMockTime(mt mockTime) *mockTime {
-	rt := mt
+func newMockTime(mt *mockTime) *mockTime {
+	rt := mockTime{
+		sleepAfter: mt.sleepAfter,
+		sysTime:    mt.sysTime,
+	}
 	rt.sleepWait = sync.WaitGroup{}
 	rt.sleepWait.Add(1)
 	rt.releaseDelay = make(chan int, 1)
@@ -508,7 +512,7 @@ func TestActiveBind(t *testing.T) {
 		doTtl:    true,
 		question: dns.Question{Name: "test", Qtype: dns.TypeA, Qclass: dns.ClassINET},
 	}
-	mockTime := newMockTime(mockTime{
+	mockTime := newMockTime(&mockTime{
 		sleepAfter: 10,
 	})
 	zlog := zerolog.New(os.Stderr).With().Timestamp().Logger()
@@ -593,7 +597,7 @@ func TestActiveBind(t *testing.T) {
 func TestDnsEventStreamRunning(t *testing.T) {
 	zlog := zerolog.New(os.Stderr).With().Timestamp().Logger()
 	des := NewDnsEventStream(&zlog)
-	ptrMockTime := newMockTime(mockTime{
+	ptrMockTime := newMockTime(&mockTime{
 		sleepAfter: 10,
 	})
 	des.timeIf = ptrMockTime
@@ -612,9 +616,9 @@ func TestDnsEventStreamRunning(t *testing.T) {
 		t.Fatal(err)
 	}
 	as.doneBackendResolve = make(chan []*DnsResult, 1)
-	bounds := []string{}
+	bounds := [][]*DnsResult{}
 	_, err = des.Bind(&ts, func(history []*DnsResult) {
-		bounds = append(bounds, history[0].Rrs[0].String())
+		bounds = append(bounds, history)
 	})
 	if err != nil {
 		t.Errorf("err should be nil: %v", err)
@@ -637,7 +641,6 @@ func TestDnsEventStreamRunning(t *testing.T) {
 			if !reflect.DeepEqual(rrs, refRrs[0].Rrs) {
 				t.Errorf("rrs should equal %v==%v", rrs, refRrs)
 			}
-
 		}
 		out = append(out, refRrs[0].Rrs[0].String())
 		ptrMockTime.releaseDelay <- 1
@@ -655,7 +658,17 @@ func TestDnsEventStreamRunning(t *testing.T) {
 	if len(bounds) != 4 {
 		t.Errorf("bounds should be 4: %v", len(bounds))
 	}
-	if !reflect.DeepEqual(bounds, []string{
+	// o, err := json.MarshalIndent(bounds, "", "  ")
+	// if err != nil {
+	// 	t.Error(err)
+	// }
+	// t.Log(string(o))
+	outChanges := make([]string, 0, len(bounds))
+	for _, b := range bounds {
+		outChanges = append(outChanges, b[0].Rrs[0].String())
+	}
+
+	if !reflect.DeepEqual(outChanges, []string{
 		"test	10	IN	A	0.0.0.0",
 		"test	10	IN	A	1.0.0.0",
 		"test	10	IN	A	2.0.0.0",

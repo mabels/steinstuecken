@@ -42,11 +42,11 @@ func sortedUniq(rrs []dns.RR) []dns.RR {
 	return out
 }
 
-func LastValidHistory(history []*DnsResult) *DnsResult {
+func NewestValidHistory(history []*DnsResult) *DnsResult {
 	if len(history) == 0 {
 		return &DnsResult{}
 	}
-	for i := len(history) - 1; i >= 0; i-- {
+	for i := 0; i < len(history); i++ {
 		if history[i].Err == nil {
 			return history[i]
 		}
@@ -64,7 +64,7 @@ func CurrentToActions(dnsrr []*DnsResult) []ActionItem {
 	if dnsrr[0].Err != nil {
 		return []ActionItem{}
 	}
-	last := LastValidHistory(dnsrr)
+	last := NewestValidHistory(dnsrr)
 	return ToActions(dnsrr[0].Rrs, last.Rrs)
 }
 

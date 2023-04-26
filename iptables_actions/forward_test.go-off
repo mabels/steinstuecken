@@ -1,0 +1,33 @@
+package iptables_actions
+
+import (
+	"os"
+	"testing"
+
+	"github.com/mabels/steinstuecken/cmd/cli"
+	"github.com/rs/zerolog"
+	"k8s.io/kubernetes/pkg/util/iptables"
+	iptest "k8s.io/kubernetes/pkg/util/iptables/testing"
+)
+
+func TestForward(t *testing.T) {
+	ipt := iptest.NewFake()
+	zlog := zerolog.New(os.Stderr)
+	target := &cli.Target{
+		// Subjects:     nil,
+		Ports:       []cli.Port{},
+		NonStateful: false,
+		Interface: struct {
+			Input  *string
+			Output *string
+		}{},
+		Protos:  []string{"tcp", "udp"},
+		Snat:    new(string),
+		Masq:    new(string),
+		Forward: new(string),
+	}
+	errs := Forward("add", &zlog, iptables.Chain("TEST"), "IP/PRE", target, ipt, []string{"-j", "JUMP"})
+	if len(errs) != 0 {
+		t.Errorf("expected no errors, got %v", errs)
+	}
+}
