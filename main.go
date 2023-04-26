@@ -49,7 +49,7 @@ func getIPAddress(rr dns.RR) (string, bool, error) {
 	txt, found := rr.(*dns.TXT)
 	if found {
 		ip := cidrInTxt(txt.Txt)
-		if ip != nil {
+		if ip == nil {
 			return "", false, fmt.Errorf("found cidr in TXT record: %v", txt.Txt)
 		}
 		return *ip, false, nil
@@ -82,7 +82,11 @@ func selectIpTable(zlog *zerolog.Logger, ipts *iptables_actions.IpTables, target
 			}
 			ipStr := cidrInTxt(rr.Txt)
 			if ipStr != nil {
-				ip := net.ParseIP(*ipStr)
+				ip, _, err := net.ParseCIDR(*ipStr)
+				if err != nil {
+					zlog.Error().Err(err).Str("ipStr", *ipStr).Msg("no ip")
+					continue
+				}
 				if ip == nil {
 					zlog.Error().Str("ipStr", *ipStr).Msg("no ip")
 					continue
