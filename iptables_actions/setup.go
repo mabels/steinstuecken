@@ -56,7 +56,9 @@ func initIPTable(zlog *zerolog.Logger, config *cli.Config, protocol iptables.Pro
 			return nil, err
 		}
 		err = table.DeleteRule(tableChain.Table, tableChain.BaseChain, "-j", chainStr)
-		if err != nil && !strings.Contains(err.Error(), fmt.Sprintf("Chain '%s' does not exist", chainStr)) {
+		if err != nil &&
+			!(strings.Contains(err.Error(), fmt.Sprintf("Chain '%s' does not exist", chainStr)) ||
+				strings.Contains(err.Error(), fmt.Sprintf("Couldn't load target `%s'", chainStr))) {
 			zlog.Error().Err(err).Msg("error deleting rule")
 			return nil, err
 		}
