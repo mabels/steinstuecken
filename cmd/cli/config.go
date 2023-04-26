@@ -152,11 +152,11 @@ func GetConfig(log *zerolog.Logger) (Config, []error) {
 	for _, targetStr := range conf.targetsStr {
 		targetUrl, err := url.Parse(targetStr)
 		if err != nil {
-			errs = append(errs, fmt.Errorf("target %s is not a valid url: %w", targetStr, err))
+			errs = append(errs, fmt.Errorf("target %s is not a valid url: %v", targetStr, err))
 			continue
 		}
 		if targetUrl.Scheme != "sken" {
-			errs = append(errs, fmt.Errorf("target %s has invalid scheme: %w", targetStr, err))
+			errs = append(errs, fmt.Errorf("target %s has invalid scheme: %v", targetStr, err))
 			continue
 		}
 		subjects, err := getSubjects(targetUrl, log)
@@ -174,7 +174,7 @@ func GetConfig(log *zerolog.Logger) (Config, []error) {
 				if len(splittedPorts) >= 1 {
 					// port, err := strconv.Atoi(splittedPorts[0])
 					// if err != nil {
-					// 	errs = append(errs, fmt.Errorf("target %s has invalid port: %w", targetStr, err))
+					// 	errs = append(errs, fmt.Errorf("target %s has invalid port: %v", targetStr, err))
 					// 	continue
 					// }
 					proto := "tcp"
@@ -183,7 +183,7 @@ func GetConfig(log *zerolog.Logger) (Config, []error) {
 					}
 					ports = append(ports, Port{Port: rePorts.Split(splittedPorts[0], -1), Proto: proto})
 				} else {
-					errs = append(errs, fmt.Errorf("target %s has invalid port: %w", targetStr, err))
+					errs = append(errs, fmt.Errorf("target %s has invalid port: %v", targetStr, err))
 					continue
 				}
 			}
